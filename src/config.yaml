@@ -23,15 +23,15 @@ class_ids:
 
 # ---- 미리보기/실험 파라미터 -----------------------------------------------
 preview:
-  sequences: ["08"]   # 돌릴 시퀀스 리스트
+  sequences: ["00"]   # 돌릴 시퀀스 리스트
   n_frames: 0   # 미사용이면 0
-  start: 0
-  end: 300
+  start: 4201
+  end: 4500
 
 # ---- 클러스터링(DBSCAN) / 추적(예정) --------------------------------------
 cluster:
   eps: 0.8
-  min_samples: 12
+  cluster_min_samples: 12
   min_points_cluster: 20
 
 window:
@@ -57,5 +57,4 @@ analysis:
   slow_min: 0.2        # m/s
   slow_max: 1.0        # m/s
 
-  min_samples: 5       # 셀 신뢰도(속도 샘플 최소 개수)
-
+  speed_min_samples: 1       # 셀 신뢰도(속도 샘플 최소 개수)
