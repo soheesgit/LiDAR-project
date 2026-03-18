@@ -1,30 +1,19 @@
-# src/heatmap_accum.py
-"""
-- Vehicle 포인트를 DBSCAN → 간단 트래킹 → 속도/체류/고유ID 히트맵 생성/저장
-- 기존 코드에서 속도가 0 근처/표준편차가 매우 작게 나오는 문제를 수정
-"""
-
 from __future__ import annotations
 from pathlib import Path
 import argparse
 import numpy as np
-import json
-from typing import List, Dict, Tuple, Optional
+from typing import List, Optional
 from sklearn.cluster import DBSCAN
+from dataclasses import dataclass
 
 from src.config import load_config, resolve_config_path
-from src.event_encoder import encode_event_type, EncoderConfig
+from src.event_encoder import EncoderConfig
+from src.final_event_scorevote import ScoreVoteConfig
 from src.event_window import EventWindow
 from src.tracking import TrackManager
 from src.kitti_io import list_pairs, read_bin_xyzr, read_sem_labels
 from src.heatmap_writer import save_map, save_bool_mask
-
-from src.final_event_scorevote import (
-    ScoreVoteConfig,
-    aggregate_final_event_scorevote,
-    attach_sequence_summary,
-    save_final_event_scorevote,
-)
+from src.sequence_summary import summarize_sequence
 
 from src.frame_processing import (
     init_sequence_state,
@@ -39,7 +28,6 @@ from src.frame_processing import (
 # 사용자 조정 영역
 # ----------------------------------------------------------------------
 N_HEAD = 2000           # 각 시퀀스에서 앞에서 이 개수만 처리 (전체 돌리려면 None 또는 음수)
-DT_SEC = 0.1            # KITTI Lidar 프레임 간격(초) 가정값 (≈10Hz)
 ASSOC_DIST = 3.0        # 트래킹 매칭 최대 거리(미터)
 MAX_AGE = 3             # 이 프레임 수만큼 미검출되면 트랙 종료
 
@@ -148,6 +136,320 @@ def _dbg_print(enabled: bool, msg: str):
     """디버그 출력 on/off 스위치 (추가)"""
     if enabled:
         print(msg)
+
+
+@dataclass
+class FrameProcessResult:
+    roi_count: int
+    occ: np.ndarray
+    dwell_delta: np.ndarray
+    sum_v_delta: np.ndarray
+    sum_v2_delta: np.ndarray
+    cnt_v_delta: np.ndarray
+    obs: list
+
+
+def emit_window_log_if_ready(
+    *,
+    t: int,
+    win: EventWindow,
+    stride: int,
+    win_n: int,
+    speed_min_samples: int,
+    enc_debug: bool,
+    enc_debug_frames: Optional[set[int]],
+) -> Optional[dict]:
+    if (t % stride != 0) or (not win.ready):
+        return None
+
+    etype, feats = win.encode()
+
+    if enc_debug and (enc_debug_frames is None or t in enc_debug_frames):
+        try:
+            focus_mask = (win.dwell > 0)            # 윈도우 내 동적 focus 후보(점유된 셀)
+            focus_n = int(np.sum(focus_mask))       # focus 셀 개수
+
+            ss = win.cnt_v.astype(np.int32)         # speed sample count
+            reliable_mask = focus_mask & (ss >= speed_min_samples)  # 신뢰 셀: speed sample 충분
+            reliable_n = int(np.sum(reliable_mask))     # 신뢰 셀 개수
+
+            # focus 셀에서 speed sample 평균/최소/최대 (샘플 부족이면 여기서 평균이 낮게 나옴)
+            if focus_n > 0:
+                ss_focus = ss[focus_mask]
+                ss_mean = float(np.mean(ss_focus))
+                ss_min = int(np.min(ss_focus))
+                ss_max = int(np.max(ss_focus))
+            else:
+                ss_mean, ss_min, ss_max = float("nan"), -1, -1
+
+            print(
+                f"[DBG WIN] t={t} focus_n={focus_n} reliable_n={reliable_n} "
+                f"SPEED_MIN_SAMPLES={speed_min_samples} "
+                f"ss_mean={ss_mean:.3f} ss_min={ss_min} ss_max={ss_max} "
+                f"feat_speed_mean={feats.get('speed_mean', None)} "
+                f"feat_speed_samples_mean={feats.get('speed_samples_mean', None)}"
+            )
+        except Exception as e:
+            print(f"[DBG WIN] t={t} (skip debug: {type(e).__name__}: {e})")
+
+    row = {
+        "frame": int(t),
+        "start": int(t - (win_n - 1)),
+        "end": int(t),
+        "event_type": str(etype),
+    }
+    row.update({k: float(v) if np.isfinite(v) else None for k, v in feats.items()})
+    return row
+
+
+def process_frame(
+    *,
+    t: int,
+    bin_path: Path,
+    lbl_path: Path,
+    state,
+    tracker: TrackManager,
+    H: int,
+    W: int,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    z_min: float,
+    z_max: float,
+    res: float,
+    vehicle_ids: set,
+    static_ids: set,
+    eps: float,
+    min_samples: int,
+    min_pts: int,
+    chk_first: int,
+    chk_every: int,
+) -> Optional[FrameProcessResult]:
+    pts = read_bin_xyzr(bin_path)
+    sem = read_sem_labels(lbl_path)
+
+    if pts.shape[0] != sem.shape[0]:
+        print(f"  [SKIP] size mismatch at {bin_path.stem}")
+        return None
+
+    roi_frame = apply_roi_filter(
+        pts=pts,
+        sem=sem,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        z_min=z_min,
+        z_max=z_max,
+    )
+    x, y, sem = roi_frame.x, roi_frame.y, roi_frame.sem
+
+    veh_m = np.isin(sem, list(vehicle_ids))
+    static_m = np.isin(sem, list(static_ids))
+
+    do_chk = (t < chk_first) or (chk_every > 0 and (t % chk_every == 0))
+    if do_chk:
+        print(
+            f"[CHK t={t}] roi_pts={len(x)} veh_pts={int(veh_m.sum())} static_pts={int(static_m.sum())}"
+        )
+
+    # c) 정적 occupancy 생성
+    occ = build_static_occupancy(
+        x=x,
+        y=y,
+        sem=sem,
+        static_ids=static_ids,
+        H=H,
+        W=W,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        res=res,
+        xy_to_cell_fn=xy_to_cell,
+    )
+    apply_static_occupancy(state, occ)
+
+    # d) 차량 delta 생성 (항상 실행)
+    veh_result = build_vehicle_deltas(
+        x=x,
+        y=y,
+        sem=sem,
+        vehicle_ids=vehicle_ids,
+        H=H,
+        W=W,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        res=res,
+        tracker=tracker,
+        cluster_vehicle_xy_fn=cluster_vehicle_xy,
+        xy_to_cell_fn=xy_to_cell,
+        eps=eps,
+        min_samples=min_samples,
+        min_pts=min_pts,
+    )
+    apply_vehicle_result(state, veh_result)
+
+    dwell_delta = veh_result.dwell_delta
+    sum_v_delta = veh_result.sum_v_delta
+    sum_v2_delta = veh_result.sum_v2_delta
+    cnt_v_delta = veh_result.cnt_v_delta
+    obs = veh_result.obs
+    roi_count = veh_result.roi_count
+    seen_tid = veh_result.seen_tid
+
+    if do_chk:
+        print(
+            f"[CHK t={t}] clusters={veh_result.cluster_count} "
+            f"centers={len(veh_result.centers)} "
+            f"(eps={eps}, min_samples={min_samples}, min_pts={min_pts})"
+        )
+        print(
+            f"[CHK t={t}] tracks_alive={len(tracker.tracks)} "
+            f"updated={veh_result.updated_track_count}"
+        )
+
+        nz = int(np.count_nonzero(dwell_delta))
+        nz_cntv = int(np.count_nonzero(cnt_v_delta))
+        print(
+            f"[CHK t={t}] roi_count={roi_count} seen_tid={len(seen_tid)} "
+            f"dwell_delta_nz={nz} cnt_v_delta_nz={nz_cntv}"
+        )
+
+    m_cnt = (cnt_v_delta > 0)
+    n_cnt = int(np.sum(m_cnt))
+    n_sum_finite = int(np.sum(np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
+    n_sum_zero = int(np.sum(sum_v_delta[m_cnt] == 0.0)) if n_cnt > 0 else 0
+    n_sum_bad = int(np.sum(~np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
+
+    if n_cnt > 0 and np.isfinite(sum_v_delta[m_cnt]).any():
+        approx_vals = sum_v_delta[m_cnt & (cnt_v_delta == 1)]
+        approx_vals = approx_vals[np.isfinite(approx_vals)]
+        if approx_vals.size > 0:
+            v_lo = float(np.min(approx_vals))
+            v_hi = float(np.max(approx_vals))
+        else:
+            v_lo = v_hi = float("nan")
+    else:
+        v_lo = v_hi = float("nan")
+
+    print(
+        f"[DBG][t={t}] delta cnt_cells={n_cnt}, sum_finite={n_sum_finite}, "
+        f"sum_zero={n_sum_zero}, sum_bad={n_sum_bad}, approx_v_range=[{v_lo:.3f},{v_hi:.3f}]"
+    )
+
+    return FrameProcessResult(
+        roi_count=roi_count,
+        occ=occ,
+        dwell_delta=dwell_delta,
+        sum_v_delta=sum_v_delta,
+        sum_v2_delta=sum_v2_delta,
+        cnt_v_delta=cnt_v_delta,
+        obs=obs,
+    )
+
+
+def save_sequence_outputs(
+    *,
+    out_dir: Path,
+    window_logs: list,
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    import json
+
+    with (out_dir / "window_events.jsonl").open("w", encoding="utf-8") as f:
+        for r in window_logs:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    print(f"[SAVE] {out_dir / 'window_events.jsonl'}")
+
+
+def run_sequence(
+    *,
+    pairs: list,
+    state,
+    tracker: TrackManager,
+    win: EventWindow,
+    H: int,
+    W: int,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    z_min: float,
+    z_max: float,
+    res: float,
+    vehicle_ids: set,
+    static_ids: set,
+    eps: float,
+    min_samples: int,
+    min_pts: int,
+    chk_first: int,
+    chk_every: int,
+    stride: int,
+    win_n: int,
+    speed_min_samples: int,
+    enc_debug: bool,
+    enc_debug_frames: Optional[set],
+) -> list[dict]:
+    window_logs = []
+
+    for t, (bin_path, lbl_path) in enumerate(pairs):
+        fr = process_frame(
+            t=t,
+            bin_path=bin_path,
+            lbl_path=lbl_path,
+            state=state,
+            tracker=tracker,
+            H=H,
+            W=W,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+            res=res,
+            vehicle_ids=vehicle_ids,
+            static_ids=static_ids,
+            eps=eps,
+            min_samples=min_samples,
+            min_pts=min_pts,
+            chk_first=chk_first,
+            chk_every=chk_every,
+        )
+
+        if fr is None:
+            continue
+
+        win.add(
+            dwell_delta=fr.dwell_delta,
+            sum_v_delta=fr.sum_v_delta,
+            sum_v2_delta=fr.sum_v2_delta,
+            cnt_v_delta=fr.cnt_v_delta,
+            static_occ=fr.occ,
+            obs=fr.obs,
+            roi_count=fr.roi_count,
+        )
+
+        row = emit_window_log_if_ready(
+            t=t,
+            win=win,
+            stride=stride,
+            win_n=win_n,
+            speed_min_samples=speed_min_samples,
+            enc_debug=enc_debug,
+            enc_debug_frames=enc_debug_frames,
+        )
+        if row is not None:
+            window_logs.append(row)
+            print("[WIN]", row)
+
+    return window_logs
 
 # ----------------------------------------------------------------------
 # 메인
@@ -311,234 +613,37 @@ def main():
         )
 
         win = EventWindow(H=H, W=W, win_n=WIN_N, enc_cfg=enc_cfg_win, dt_sec=dt_sec)
-        window_logs = []
 
         # ─────────────────────────────────────────────────────────────
         # 2-1) 프레임 단위 루프
         # ─────────────────────────────────────────────────────────────
-        for t, (bin_path, lbl_path) in enumerate(pairs):
-            # a) 포인트/라벨 로드
-            pts = read_bin_xyzr(bin_path)
-            sem = read_sem_labels(lbl_path)
-
-            if pts.shape[0] != sem.shape[0]:
-                print(f"  [SKIP] size mismatch at {bin_path.stem}")
-                continue
-
-            # b) ROI 필터
-            roi_frame = apply_roi_filter(
-                pts=pts,
-                sem=sem,
-                x_min=X_MIN,
-                x_max=X_MAX,
-                y_min=Y_MIN,
-                y_max=Y_MAX,
-                z_min=Z_MIN,
-                z_max=Z_MAX,
-            )
-            x, y, sem = roi_frame.x, roi_frame.y, roi_frame.sem
-
-            veh_m = np.isin(sem, list(VEHICLE_IDS))
-            static_m = np.isin(sem, list(STATIC_IDS))
-
-            do_chk = (t < chk_first) or (chk_every > 0 and (t % chk_every == 0))
-            if do_chk:
-                print(
-                    f"[CHK t={t}] roi_pts={len(x)} veh_pts={int(veh_m.sum())} static_pts={int(static_m.sum())}"
-                )
-
-            # c) 정적 occupancy 생성
-            occ = build_static_occupancy(
-                x=x,
-                y=y,
-                sem=sem,
-                static_ids=STATIC_IDS,
-                H=H,
-                W=W,
-                x_min=X_MIN,
-                x_max=X_MAX,
-                y_min=Y_MIN,
-                y_max=Y_MAX,
-                res=RES,
-                xy_to_cell_fn=xy_to_cell,
-            )
-
-            apply_static_occupancy(state, occ)
-
-            # d) 차량 delta 생성 (항상 실행)
-            veh_result = build_vehicle_deltas(
-                x=x,
-                y=y,
-                sem=sem,
-                vehicle_ids=VEHICLE_IDS,
-                H=H,
-                W=W,
-                x_min=X_MIN,
-                x_max=X_MAX,
-                y_min=Y_MIN,
-                y_max=Y_MAX,
-                res=RES,
-                tracker=tracker,
-                cluster_vehicle_xy_fn=cluster_vehicle_xy,
-                xy_to_cell_fn=xy_to_cell,
-                eps=eps,
-                min_samples=min_samples,
-                min_pts=min_pts,
-            )
-
-            apply_vehicle_result(state, veh_result)
-
-            dwell_delta = veh_result.dwell_delta
-            sum_v_delta = veh_result.sum_v_delta
-            sum_v2_delta = veh_result.sum_v2_delta
-            cnt_v_delta = veh_result.cnt_v_delta
-            obs = veh_result.obs
-            roi_count = veh_result.roi_count
-            seen_tid = veh_result.seen_tid
-
-            if do_chk:
-                print(
-                    f"[CHK t={t}] clusters={veh_result.cluster_count} "
-                    f"centers={len(veh_result.centers)} "
-                    f"(eps={eps}, min_samples={min_samples}, min_pts={min_pts})"
-                )
-                print(
-                    f"[CHK t={t}] tracks_alive={len(tracker.tracks)} "
-                    f"updated={veh_result.updated_track_count}"
-                )
-
-                nz = int(np.count_nonzero(dwell_delta))
-                nz_cntv = int(np.count_nonzero(cnt_v_delta))
-                print(
-                    f"[CHK t={t}] roi_count={roi_count} seen_tid={len(seen_tid)} "
-                    f"dwell_delta_nz={nz} cnt_v_delta_nz={nz_cntv}"
-                )
-
-            # ------------------------------------------------------------------
-            # [DEBUG] 윈도우에 넣기 전, "이번 프레임 델타"가 정상인지 점검
-            # - cnt_v_delta > 0 인 셀인데 sum_v_delta가 0/NaN이면 속도 누적이 깨진 것
-            # - sum_v_delta/cnt_v_delta가 유한하면 speed_mean이 나와야 정상
-            # ------------------------------------------------------------------
-            if True:  # 디버깅 끄고 싶으면 False로
-                m_cnt = (cnt_v_delta > 0)
-
-                # 이번 프레임에 속도 샘플이 찍힌 셀 수
-                n_cnt = int(np.sum(m_cnt))
-
-                # 속도 합이 유한한 셀 수(정상 기대: n_cnt랑 비슷)
-                n_sum_finite = int(np.sum(np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
-
-                # cnt>0인데 sum이 0인 셀(비정상 징후일 수 있음: 속도 계산이 0만 들어가거나 누락)
-                n_sum_zero = int(np.sum(sum_v_delta[m_cnt] == 0.0)) if n_cnt > 0 else 0
-
-                # cnt>0인데 sum이 NaN/inf인 셀(명백한 버그)
-                n_sum_bad = int(np.sum(~np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
-
-                # 속도 샘플 값의 대략 범위(유한 값 기준)
-                if n_cnt > 0 and np.isfinite(sum_v_delta[m_cnt]).any():
-                    # cnt=1인 셀은 sum이 곧 speed라 범위 확인에 좋음
-                    approx_vals = sum_v_delta[m_cnt & (cnt_v_delta == 1)]
-                    approx_vals = approx_vals[np.isfinite(approx_vals)]
-                    if approx_vals.size > 0:
-                        v_lo = float(np.min(approx_vals))
-                        v_hi = float(np.max(approx_vals))
-                    else:
-                        v_lo = v_hi = float("nan")
-                else:
-                    v_lo = v_hi = float("nan")
-
-                print(
-                    f"[DBG][t={t}] delta cnt_cells={n_cnt}, sum_finite={n_sum_finite}, "
-                    f"sum_zero={n_sum_zero}, sum_bad={n_sum_bad}, approx_v_range=[{v_lo:.3f},{v_hi:.3f}]"
-                )
-
-            # ----- 슬라이딩 윈도우에 이번 프레임 델타 반영 -----
-            win.add(
-                dwell_delta=dwell_delta,
-                sum_v_delta=sum_v_delta,
-                sum_v2_delta=sum_v2_delta,
-                cnt_v_delta=cnt_v_delta,
-                static_occ=occ,
-                obs=obs,
-                roi_count=roi_count,
-            )
-
-            # ----- stride마다 윈도우 결과 출력/저장 -----
-            if (t % STRIDE == 0) and win.ready:
-                etype, feats = win.encode()
-
-                # (추가) 윈도우 단에서 "왜 speed_mean이 NaN인지"를 직접 찍는 디버그 로그
-                # - 핵심은 reliable 셀(=cnt_v >= MIN_SAMPLES)이 0개인지 여부임
-                # - EventWindow 내부 누적(cnt_v, dwell 등)이 존재한다고 가정하고 읽어오되,
-                #   만약 구현이 다르면 AttributeError가 날 수 있으니 try/except로 안전 처리
-                if enc_debug and (enc_debug_frames is None or t in enc_debug_frames):
-                    try:
-                        # win.dwell: 윈도우 내부 누적 dwell(최근 WIN_N 기준)
-                        # win.cnt_v: 윈도우 내부 누적 speed sample count(최근 WIN_N 기준)
-                        focus_mask = (win.dwell > 0)                 # 윈도우 내 동적 focus 후보(점유된 셀)
-                        focus_n = int(np.sum(focus_mask))            # focus 셀 개수
-                        ss = win.cnt_v.astype(np.int32)              # speed sample count
-                        reliable_mask = focus_mask & (ss >= SPEED_MIN_SAMPLES)  # 신뢰 셀: speed sample 충분
-                        reliable_n = int(np.sum(reliable_mask))      # 신뢰 셀 개수
-
-                        # focus 셀에서 speed sample 평균/최소/최대 (샘플 부족이면 여기서 평균이 낮게 나옴)
-                        if focus_n > 0:
-                            ss_focus = ss[focus_mask]
-                            ss_mean = float(np.mean(ss_focus))
-                            ss_min = int(np.min(ss_focus))
-                            ss_max = int(np.max(ss_focus))
-                        else:
-                            ss_mean, ss_min, ss_max = float("nan"), -1, -1
-
-                        _dbg_print(
-                            True,
-                            f"[DBG WIN] t={t} focus_n={focus_n} reliable_n={reliable_n} "
-                            f"SPEED_MIN_SAMPLES={SPEED_MIN_SAMPLES} ss_mean={ss_mean:.3f} ss_min={ss_min} ss_max={ss_max} "
-                            f"feat_speed_mean={feats.get('speed_mean', None)} feat_speed_samples_mean={feats.get('speed_samples_mean', None)}"
-                        )
-                    except Exception as e:
-                        _dbg_print(True, f"[DBG WIN] t={t} (skip debug: {type(e).__name__}: {e})")
-
-                row = {
-                    "frame": int(t),
-                    "start": int(t - (WIN_N - 1)),
-                    "end": int(t),
-                    "event_type": str(etype),
-                }
-                row.update({k: float(v) if np.isfinite(v) else None for k, v in feats.items()})
-                window_logs.append(row)
-                print("[WIN]", row)
-
-        # ─────────────────────────────────────────────────────────────
-        # 2-2) 시퀀스 종료 후: 지도 계산/저장
-        # ─────────────────────────────────────────────────────────────
-        # a) 속도 mean/std 계산
-        mean_v = np.full((H, W), np.nan, dtype=np.float32)
-        std_v  = np.full((H, W), np.nan, dtype=np.float32)
-
-        m_any = state.cnt_v > 0
-
-        mean_v = np.divide(
-            state.sum_v.astype(np.float32),
-            state.cnt_v.astype(np.float32),
-            out=np.full((H, W), np.nan, dtype=np.float32),
-            where=m_any
-        ).astype(np.float32)
-
-        m_std = state.cnt_v >= 3
-        if np.any(m_std):
-            mean_v2 = np.divide(
-                state.sum_v2.astype(np.float32),
-                state.cnt_v.astype(np.float32),
-                out=np.full((H, W), np.nan, dtype=np.float32),
-                where=m_std
-            )
-
-            var = mean_v2 - (mean_v ** 2)
-            var = np.where(m_std, var, np.nan)
-            var = np.clip(var, 0.0, None)
-
-            std_v = np.sqrt(var).astype(np.float32)
+        window_logs = run_sequence(
+            pairs=pairs,
+            state=state,
+            tracker=tracker,
+            win=win,
+            H=H,
+            W=W,
+            x_min=X_MIN,
+            x_max=X_MAX,
+            y_min=Y_MIN,
+            y_max=Y_MAX,
+            z_min=Z_MIN,
+            z_max=Z_MAX,
+            res=RES,
+            vehicle_ids=VEHICLE_IDS,
+            static_ids=STATIC_IDS,
+            eps=eps,
+            min_samples=min_samples,
+            min_pts=min_pts,
+            chk_first=chk_first,
+            chk_every=chk_every,
+            stride=STRIDE,
+            win_n=WIN_N,
+            speed_min_samples=SPEED_MIN_SAMPLES,
+            enc_debug=enc_debug,
+            enc_debug_frames=enc_debug_frames,
+        )
 
         # b) 출력 디렉토리
         # 범위 소스 무관하게 range_start/range_end로 폴더명 생성
@@ -549,41 +654,15 @@ def main():
         else:
             out_dir = out_root / seq
 
-        # c) 고유 차량 수 맵
-        unique_cnt = np.array(
-            [[len(state.unique_sets[y][x]) for x in range(W)] for y in range(H)],
-            dtype=np.int32
-        )
-
-        # d) 정적 변화율 계산 (정규화: (T-1)로 나눠 0~1 근사)
-        T_eff = max(1, len(pairs) - 1)
-        static_change_rate = state.static_change_count.astype(np.float32) / float(T_eff)
-
-        # (추가) 시퀀스 단에서 speed_mean이 NaN이 되는 가장 흔한 원인(신뢰 셀 0개)을 요약 출력
-        # - reliable = (cnt_v >= SPEED_MIN_SAMPLES) 조건을 통과하는 셀이 없으면,
-        #   encoder는 speed_mean을 NaN으로 처리하게 됨(네가 올린 event_encoder 로직 기준)
-        if enc_debug:
-            focus_mask_seq = (state.dwell > 0)                              # 시퀀스 누적 기준 "점유된 셀"
-            focus_n_seq = int(np.sum(focus_mask_seq))                 # 점유된 셀 수
-            reliable_seq = focus_mask_seq & (state.cnt_v >= SPEED_MIN_SAMPLES)    # 점유 + 샘플 충분
-            reliable_n_seq = int(np.sum(reliable_seq))                # 신뢰 셀 수
-
-            if focus_n_seq > 0:
-                ss_focus_seq = state.cnt_v[focus_mask_seq]
-                ss_mean_seq = float(np.mean(ss_focus_seq))
-                ss_min_seq = int(np.min(ss_focus_seq))
-                ss_max_seq = int(np.max(ss_focus_seq))
-            else:
-                ss_mean_seq, ss_min_seq, ss_max_seq = float("nan"), -1, -1
-
-            print(f"[DBG SEQ] {seq} focus_n={focus_n_seq} reliable_n={reliable_n_seq} "
-                  f"SPEED_MIN_SAMPLES={SPEED_MIN_SAMPLES} ss_mean={ss_mean_seq:.3f} ss_min={ss_min_seq} ss_max={ss_max_seq}")
-
-        event_type, feats = encode_event_type(
-            unique_cnt_map=unique_cnt.astype(np.float32),
-            mean_speed_map=mean_v.astype(np.float32),
-            dwell_map=state.dwell.astype(np.float32),
-            cfg=EncoderConfig(
+        summary = summarize_sequence(
+            state=state,
+            H=H,
+            W=W,
+            num_frames=len(pairs),
+            speed_min_samples=SPEED_MIN_SAMPLES,
+            window_logs=window_logs,
+            out_dir=out_dir,
+            enc_cfg=EncoderConfig(
                 density_cap_cell=0.3,
                 cell_size_m=0.8,
                 n_frames=301,
@@ -596,48 +675,25 @@ def main():
                 require_speed_samples=True,
                 ego_motion_low=0.10,
             ),
-            static_dwell_map=state.static_dwell.astype(np.float32),
-            static_change_rate=static_change_rate.astype(np.float32),
-            speed_samples_map=state.cnt_v.astype(np.float32),
+            scorevote_cfg=ScoreVoteConfig(
+                v_ok=6.0,
+                empty_d_th=0.03,
+                a=0.50,
+                b=0.30,
+                c=0.20,
+            ),
+            enc_debug=enc_debug,
         )
 
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # ----- 윈도우별 결과 저장 -----
-        with (out_dir / "window_events.jsonl").open("w", encoding="utf-8") as f:
-            for r in window_logs:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"[SAVE] {out_dir / 'window_events.jsonl'}")
-
-        # ----- 최종 결과 저장 -----
-        scorevote_cfg = ScoreVoteConfig(
-            v_ok=6.0,
-            empty_d_th=0.03,
-            a=0.50,
-            b=0.30,
-            c=0.20,
-        )
-
-        final_result = aggregate_final_event_scorevote(
-            window_logs=window_logs,
-            cfg=scorevote_cfg,
-        )
-
-        final_result = attach_sequence_summary(
-            result=final_result,
-            seq_event_type=event_type,
-            seq_feats=feats,
-        )
-
-        summary_path = save_final_event_scorevote(
+        save_sequence_outputs(
             out_dir=out_dir,
-            result=final_result,
+            window_logs=window_logs,
         )
 
-        print(
-            f"[FINAL] {final_result.final_event_type} "
-            f"(conf={final_result.confidence:.3f}) -> {summary_path}"
-        )
+        mean_v = summary.mean_v
+        std_v = summary.std_v
+        unique_cnt = summary.unique_cnt
+        static_change_rate = summary.static_change_rate
 
 
         # e) 기초 결과 저장(샘플/속도/정적)
@@ -708,11 +764,12 @@ def main():
                  f"{seq} final classmap (0=free,1=ego,2=cong,3=s&g,4=slow)", final_vis, vmin=0, vmax=4)
 
         # i) 요약 통계
-        total_cells = int(np.sum(m_any))
+        sampled_mask = (state.cnt_v > 0)
+        total_cells = int(np.sum(sampled_mask))
         print(f"  [SUMMARY] cells with speed samples: {total_cells}")
         if total_cells > 0:
-            print(f"           mean(speed) over sampled cells = {float(np.nanmean(mean_v[m_any])):.2f} m/s")
-            print(f"           median(speed) over sampled cells = {float(np.nanmedian(mean_v[m_any])):.2f} m/s")
+            print(f"           mean(speed) over sampled cells = {float(np.nanmean(mean_v[sampled_mask])):.2f} m/s")
+            print(f"           median(speed) over sampled cells = {float(np.nanmedian(mean_v[sampled_mask])):.2f} m/s")
 
 if __name__ == "__main__":
     main()

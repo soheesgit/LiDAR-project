@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import json
+import numpy as np
+
+from src.event_encoder import encode_event_type, EncoderConfig
+from src.final_event_scorevote import (
+    ScoreVoteConfig,
+    aggregate_final_event_scorevote,
+    attach_sequence_summary,
+    save_final_event_scorevote,
+)
+
+
+@dataclass
+class SequenceSummary:
+    mean_v: np.ndarray
+    std_v: np.ndarray
+    unique_cnt: np.ndarray
+    static_change_rate: np.ndarray
+    event_type: str
+    feats: dict
+    final_result: object
+    summary_path: Path
+
+
+def compute_speed_stats(sum_v: np.ndarray, sum_v2: np.ndarray, cnt_v: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    H, W = cnt_v.shape
+    mean_v = np.full((H, W), np.nan, dtype=np.float32)
+    std_v = np.full((H, W), np.nan, dtype=np.float32)
+
+    m_any = cnt_v > 0
+    mean_v = np.divide(
+        sum_v.astype(np.float32),
+        cnt_v.astype(np.float32),
+        out=np.full((H, W), np.nan, dtype=np.float32),
+        where=m_any,
+    ).astype(np.float32)
+
+    m_std = cnt_v >= 3
+    if np.any(m_std):
+        mean_v2 = np.divide(
+            sum_v2.astype(np.float32),
+            cnt_v.astype(np.float32),
+            out=np.full((H, W), np.nan, dtype=np.float32),
+            where=m_std,
+        )
+        var = mean_v2 - (mean_v ** 2)
+        var = np.where(m_std, var, np.nan)
+        var = np.clip(var, 0.0, None)
+        std_v = np.sqrt(var).astype(np.float32)
+
+    return mean_v, std_v, m_any
+
+
+def compute_unique_count_map(unique_sets: list[list[set[int]]], H: int, W: int) -> np.ndarray:
+    return np.array(
+        [[len(unique_sets[y][x]) for x in range(W)] for y in range(H)],
+        dtype=np.int32,
+    )
+
+
+def compute_static_change_rate(static_change_count: np.ndarray, num_frames: int) -> np.ndarray:
+    t_eff = max(1, num_frames - 1)
+    return static_change_count.astype(np.float32) / float(t_eff)
+
+
+def save_window_events_jsonl(out_dir: Path, window_logs: list[dict]) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "window_events.jsonl"
+    with path.open("w", encoding="utf-8") as f:
+        for row in window_logs:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"[SAVE] {path}")
+    return path
+
+
+def summarize_sequence(
+    *,
+    state,
+    H: int,
+    W: int,
+    num_frames: int,
+    speed_min_samples: int,
+    window_logs: list[dict],
+    out_dir: Path,
+    enc_cfg: EncoderConfig,
+    scorevote_cfg: ScoreVoteConfig,
+    enc_debug: bool = False,
+) -> SequenceSummary:
+    mean_v, std_v, m_any = compute_speed_stats(
+        state.sum_v,
+        state.sum_v2,
+        state.cnt_v,
+    )
+
+    unique_cnt = compute_unique_count_map(state.unique_sets, H, W)
+    static_change_rate = compute_static_change_rate(state.static_change_count, num_frames)
+
+    if enc_debug:
+        focus_mask_seq = (state.dwell > 0)
+        focus_n_seq = int(np.sum(focus_mask_seq))
+        reliable_seq = focus_mask_seq & (state.cnt_v >= speed_min_samples)
+        reliable_n_seq = int(np.sum(reliable_seq))
+
+        if focus_n_seq > 0:
+            ss_focus_seq = state.cnt_v[focus_mask_seq]
+            ss_mean_seq = float(np.mean(ss_focus_seq))
+            ss_min_seq = int(np.min(ss_focus_seq))
+            ss_max_seq = int(np.max(ss_focus_seq))
+        else:
+            ss_mean_seq, ss_min_seq, ss_max_seq = float("nan"), -1, -1
+
+        print(
+            f"[DBG SEQ] focus_n={focus_n_seq} reliable_n={reliable_n_seq} "
+            f"SPEED_MIN_SAMPLES={speed_min_samples} "
+            f"ss_mean={ss_mean_seq:.3f} ss_min={ss_min_seq} ss_max={ss_max_seq}"
+        )
+
+    event_type, feats = encode_event_type(
+        unique_cnt_map=unique_cnt.astype(np.float32),
+        mean_speed_map=mean_v.astype(np.float32),
+        dwell_map=state.dwell.astype(np.float32),
+        cfg=enc_cfg,
+        static_dwell_map=state.static_dwell.astype(np.float32),
+        static_change_rate=static_change_rate.astype(np.float32),
+        speed_samples_map=state.cnt_v.astype(np.float32),
+    )
+
+    save_window_events_jsonl(out_dir, window_logs)
+
+    final_result = aggregate_final_event_scorevote(
+        window_logs=window_logs,
+        cfg=scorevote_cfg,
+    )
+    final_result = attach_sequence_summary(
+        result=final_result,
+        seq_event_type=event_type,
+        seq_feats=feats,
+    )
+    summary_path = save_final_event_scorevote(
+        out_dir=out_dir,
+        result=final_result,
+    )
+
+    print(
+        f"[FINAL] {final_result.final_event_type} "
+        f"(conf={final_result.confidence:.3f}) -> {summary_path}"
+    )
+
+    return SequenceSummary(
+        mean_v=mean_v,
+        std_v=std_v,
+        unique_cnt=unique_cnt,
+        static_change_rate=static_change_rate,
+        event_type=event_type,
+        feats=feats,
+        final_result=final_result,
+        summary_path=summary_path,
+    )
