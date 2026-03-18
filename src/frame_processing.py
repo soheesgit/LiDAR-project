@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable
 import numpy as np
 
 from src.tracking import TrackManager
@@ -12,6 +12,18 @@ class RoiFrame:
     x: np.ndarray
     y: np.ndarray
     sem: np.ndarray
+
+
+@dataclass
+class SequenceState:
+    unique_sets: list[list[set[int]]]
+    dwell: np.ndarray
+    sum_v: np.ndarray
+    sum_v2: np.ndarray
+    cnt_v: np.ndarray
+    static_dwell: np.ndarray
+    static_change_count: np.ndarray
+    static_prev_occ: np.ndarray | None = None
 
 
 @dataclass
@@ -27,6 +39,19 @@ class VehicleDeltaResult:
     sizes: list[int]
     cluster_count: int
     updated_track_count: int
+
+
+def init_sequence_state(H: int, W: int) -> SequenceState:
+    return SequenceState(
+        unique_sets=[[set() for _ in range(W)] for _ in range(H)],
+        dwell=np.zeros((H, W), dtype=np.int32),
+        sum_v=np.zeros((H, W), dtype=np.float32),
+        sum_v2=np.zeros((H, W), dtype=np.float32),
+        cnt_v=np.zeros((H, W), dtype=np.int32),
+        static_dwell=np.zeros((H, W), dtype=np.int32),
+        static_change_count=np.zeros((H, W), dtype=np.int32),
+        static_prev_occ=None,
+    )
 
 
 def apply_roi_filter(
@@ -79,6 +104,16 @@ def build_static_occupancy(
     return occ
 
 
+def apply_static_occupancy(state: SequenceState, occ: np.ndarray) -> None:
+    state.static_dwell += occ.astype(np.int32)
+
+    if state.static_prev_occ is not None:
+        diff = np.logical_xor(occ, state.static_prev_occ)
+        state.static_change_count += diff.astype(np.int32)
+
+    state.static_prev_occ = occ
+
+
 def build_vehicle_deltas(
     x: np.ndarray,
     y: np.ndarray,
@@ -97,11 +132,6 @@ def build_vehicle_deltas(
     eps: float,
     min_samples: int,
     min_pts: int,
-    dwell: np.ndarray,
-    unique_sets,
-    sum_v: np.ndarray,
-    sum_v2: np.ndarray,
-    cnt_v: np.ndarray,
 ) -> VehicleDeltaResult:
     dwell_delta = np.zeros((H, W), dtype=np.int32)
     sum_v_delta = np.zeros((H, W), dtype=np.float32)
@@ -154,8 +184,6 @@ def build_vehicle_deltas(
         obs.append((tid_int, iyy, ixx, spd))
 
         dwell_delta[iyy, ixx] += 1
-        dwell[iyy, ixx] += 1
-        unique_sets[iyy][ixx].add(tid_int)
 
         if tr.has_velocity:
             v = float(tr.speed)
@@ -163,10 +191,6 @@ def build_vehicle_deltas(
                 sum_v_delta[iyy, ixx] += v
                 sum_v2_delta[iyy, ixx] += v * v
                 cnt_v_delta[iyy, ixx] += 1
-
-                sum_v[iyy, ixx] += v
-                sum_v2[iyy, ixx] += v * v
-                cnt_v[iyy, ixx] += 1
 
     return VehicleDeltaResult(
         dwell_delta=dwell_delta,
@@ -181,3 +205,13 @@ def build_vehicle_deltas(
         cluster_count=len(clusters),
         updated_track_count=updated_track_count,
     )
+
+
+def apply_vehicle_result(state: SequenceState, result: VehicleDeltaResult) -> None:
+    state.dwell += result.dwell_delta
+    state.sum_v += result.sum_v_delta
+    state.sum_v2 += result.sum_v2_delta
+    state.cnt_v += result.cnt_v_delta
+
+    for tid_int, iyy, ixx, _spd in result.obs:
+        state.unique_sets[iyy][ixx].add(int(tid_int))

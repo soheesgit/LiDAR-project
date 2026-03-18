@@ -27,9 +27,12 @@ from src.final_event_scorevote import (
 )
 
 from src.frame_processing import (
+    init_sequence_state,
     apply_roi_filter,
     build_static_occupancy,
+    apply_static_occupancy,
     build_vehicle_deltas,
+    apply_vehicle_result,
 )
 
 # ----------------------------------------------------------------------
@@ -282,17 +285,7 @@ def main():
             print(f"  frames to process: {len(pairs)}")
 
         # ── 누적 버퍼(셀 단위)
-        # 차량 관련: 고유 트랙ID 집합/체류/속도합/제곱합/샘플수
-        unique_sets: List[List[set]] = [[set() for _ in range(W)] for _ in range(H)]    # BEV 격자의 각 셀에 “등장한 객체 ID들”을 저장하기 위한 구조
-        dwell  = np.zeros((H, W), dtype=np.int32)           # 각 셀에 “객체가 머무른 프레임 수(체류 시간)”를 저장
-        sum_v  = np.zeros((H, W), dtype=np.float32)         # 속도(velocity) 값을 누적 합하는 용도. 평균 속도를 나중에 구할 수 있음
-        sum_v2 = np.zeros((H, W), dtype=np.float32)         # 속도의 제곱을 누적합. 분산(속도의 변동성)을 계산할 때 사용
-        cnt_v  = np.zeros((H, W), dtype=np.int32)           # 해당 셀에 속도 샘플이 몇 번 기록되었는지(속도 데이터 개수) 카운트
-
-        # 정적 채널: 프레임 점유/프레임간 XOR 변화 카운트
-        static_dwell = np.zeros((H, W), dtype=np.int32)
-        static_change_count = np.zeros((H, W), dtype=np.int32)
-        static_prev_occ: Optional[np.ndarray] = None  # 직전 프레임 정적 점유 비트맵
+        state = init_sequence_state(H, W)
 
         # 트랙 관리자(근접-그리디): 단순하지만 빠르고 구현 간단
         tracker = TrackManager(ASSOC_DIST, MAX_AGE, dt_sec)
@@ -370,12 +363,7 @@ def main():
                 xy_to_cell_fn=xy_to_cell,
             )
 
-            static_dwell += occ.astype(np.int32)
-
-            if static_prev_occ is not None:
-                diff = np.logical_xor(occ, static_prev_occ)
-                static_change_count += diff.astype(np.int32)
-            static_prev_occ = occ
+            apply_static_occupancy(state, occ)
 
             # d) 차량 delta 생성 (항상 실행)
             veh_result = build_vehicle_deltas(
@@ -396,12 +384,9 @@ def main():
                 eps=eps,
                 min_samples=min_samples,
                 min_pts=min_pts,
-                dwell=dwell,
-                unique_sets=unique_sets,
-                sum_v=sum_v,
-                sum_v2=sum_v2,
-                cnt_v=cnt_v,
             )
+
+            apply_vehicle_result(state, veh_result)
 
             dwell_delta = veh_result.dwell_delta
             sum_v_delta = veh_result.sum_v_delta
@@ -531,20 +516,20 @@ def main():
         mean_v = np.full((H, W), np.nan, dtype=np.float32)
         std_v  = np.full((H, W), np.nan, dtype=np.float32)
 
-        m_any = cnt_v > 0
+        m_any = state.cnt_v > 0
 
         mean_v = np.divide(
-            sum_v.astype(np.float32),
-            cnt_v.astype(np.float32),
+            state.sum_v.astype(np.float32),
+            state.cnt_v.astype(np.float32),
             out=np.full((H, W), np.nan, dtype=np.float32),
             where=m_any
         ).astype(np.float32)
 
-        m_std = cnt_v >= 3
+        m_std = state.cnt_v >= 3
         if np.any(m_std):
             mean_v2 = np.divide(
-                sum_v2.astype(np.float32),
-                cnt_v.astype(np.float32),
+                state.sum_v2.astype(np.float32),
+                state.cnt_v.astype(np.float32),
                 out=np.full((H, W), np.nan, dtype=np.float32),
                 where=m_std
             )
@@ -566,25 +551,25 @@ def main():
 
         # c) 고유 차량 수 맵
         unique_cnt = np.array(
-            [[len(unique_sets[y][x]) for x in range(W)] for y in range(H)],
+            [[len(state.unique_sets[y][x]) for x in range(W)] for y in range(H)],
             dtype=np.int32
         )
 
         # d) 정적 변화율 계산 (정규화: (T-1)로 나눠 0~1 근사)
         T_eff = max(1, len(pairs) - 1)
-        static_change_rate = static_change_count.astype(np.float32) / float(T_eff)
+        static_change_rate = state.static_change_count.astype(np.float32) / float(T_eff)
 
         # (추가) 시퀀스 단에서 speed_mean이 NaN이 되는 가장 흔한 원인(신뢰 셀 0개)을 요약 출력
         # - reliable = (cnt_v >= SPEED_MIN_SAMPLES) 조건을 통과하는 셀이 없으면,
         #   encoder는 speed_mean을 NaN으로 처리하게 됨(네가 올린 event_encoder 로직 기준)
         if enc_debug:
-            focus_mask_seq = (dwell > 0)                              # 시퀀스 누적 기준 "점유된 셀"
+            focus_mask_seq = (state.dwell > 0)                              # 시퀀스 누적 기준 "점유된 셀"
             focus_n_seq = int(np.sum(focus_mask_seq))                 # 점유된 셀 수
-            reliable_seq = focus_mask_seq & (cnt_v >= SPEED_MIN_SAMPLES)    # 점유 + 샘플 충분
+            reliable_seq = focus_mask_seq & (state.cnt_v >= SPEED_MIN_SAMPLES)    # 점유 + 샘플 충분
             reliable_n_seq = int(np.sum(reliable_seq))                # 신뢰 셀 수
 
             if focus_n_seq > 0:
-                ss_focus_seq = cnt_v[focus_mask_seq]
+                ss_focus_seq = state.cnt_v[focus_mask_seq]
                 ss_mean_seq = float(np.mean(ss_focus_seq))
                 ss_min_seq = int(np.min(ss_focus_seq))
                 ss_max_seq = int(np.max(ss_focus_seq))
@@ -597,7 +582,7 @@ def main():
         event_type, feats = encode_event_type(
             unique_cnt_map=unique_cnt.astype(np.float32),
             mean_speed_map=mean_v.astype(np.float32),
-            dwell_map=dwell.astype(np.float32),
+            dwell_map=state.dwell.astype(np.float32),
             cfg=EncoderConfig(
                 density_cap_cell=0.3,
                 cell_size_m=0.8,
@@ -611,9 +596,9 @@ def main():
                 require_speed_samples=True,
                 ego_motion_low=0.10,
             ),
-            static_dwell_map=static_dwell.astype(np.float32),
+            static_dwell_map=state.static_dwell.astype(np.float32),
             static_change_rate=static_change_rate.astype(np.float32),
-            speed_samples_map=cnt_v.astype(np.float32),
+            speed_samples_map=state.cnt_v.astype(np.float32),
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -657,10 +642,10 @@ def main():
 
         # e) 기초 결과 저장(샘플/속도/정적)
         save_map(out_dir / "speed_samples.png",
-                 f"{seq} speed samples per cell", cnt_v.astype(float))
+                 f"{seq} speed samples per cell", state.cnt_v.astype(float))
 
         # 신뢰 셀 정의(분류/표시에서 사용할 마스크)
-        reliable = (cnt_v >= SPEED_MIN_SAMPLES)
+        reliable = (state.cnt_v >= SPEED_MIN_SAMPLES)
 
         # "신뢰 셀만" 남긴 표준편차 히트맵(디버깅용)
         std_masked = np.where(reliable, std_v, np.nan)
@@ -674,19 +659,19 @@ def main():
 
         # 기타 기본 히트맵 저장
         save_map(out_dir / "unique_ids.png", f"{seq} unique track IDs", unique_cnt.astype(float))
-        save_map(out_dir / "dwell.png",      f"{seq} dwell (frames)",    dwell.astype(float))
+        save_map(out_dir / "dwell.png",      f"{seq} dwell (frames)",    state.dwell.astype(float))
         save_map(out_dir / "mean_speed.png", f"{seq} mean speed (m/s)",  mean_v, vmin=0.0, vmax=SPEED_VMAX)
         save_map(out_dir / "std_speed.png",  f"{seq} std speed (m/s)",   std_v,  vmin=0.0, vmax=STD_VMAX)
 
         # 정적 채널 저장
         save_map(out_dir / "static_dwell.png",
-                 f"{seq} static dwell (frames)", static_dwell.astype(float))
+                 f"{seq} static dwell (frames)", state.static_dwell.astype(float))
         save_map(out_dir / "static_change_rate.png",
                  f"{seq} static change rate", static_change_rate, vmin=0.0, vmax=None)
 
         # f) 상태별 마스크 생성
-        ego_stop_mask = reliable & (mean_v <= V_SLOW) & (static_change_rate <= SC_LOW) & (static_dwell >= 1)
-        congestion_mask = reliable & (mean_v <= V_SLOW) & (dwell >= DWELL_HIGH) & (unique_cnt <= UID_LOW)
+        ego_stop_mask = reliable & (mean_v <= V_SLOW) & (static_change_rate <= SC_LOW) & (state.static_dwell >= 1)
+        congestion_mask = reliable & (mean_v <= V_SLOW) & (state.dwell >= DWELL_HIGH) & (unique_cnt <= UID_LOW)
         stopngo_mask = reliable & (mean_v <= V_SLOW) & (std_v >= STD_HIGH)
         freeflow_mask = reliable & (mean_v >= V_FAST) & (std_v < STD_HIGH) \
                         & (unique_cnt > UID_LOW) & (static_change_rate >= SC_HIGH)
