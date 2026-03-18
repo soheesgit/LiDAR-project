@@ -5,7 +5,6 @@
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
 from pathlib import Path
 import argparse
 import numpy as np
@@ -17,6 +16,14 @@ from sklearn.cluster import DBSCAN
 
 from src.event_encoder import encode_event_type, EncoderConfig
 from src.event_window import EventWindow
+from src.tracking import TrackManager
+
+from src.final_event_scorevote import (
+    ScoreVoteConfig,
+    aggregate_final_event_scorevote,
+    attach_sequence_summary,
+    save_final_event_scorevote,
+)
 
 # ----------------------------------------------------------------------
 # 사용자 조정 영역
@@ -180,107 +187,6 @@ def cluster_vehicle_xy(xy: np.ndarray, eps: float, min_samples: int, min_pts: in
     # 조건을 통과한 클러스터들의 점 배열 리스트 반환
     return clusters
 
-# ----------------------------------------------------------------------
-# 트래킹
-# ----------------------------------------------------------------------
-@dataclass
-class Track:
-    """하나의 트랙(클러스터 중심)을 표현"""
-    tid: int                             # 트랙 ID (각 차량을 구분하는 고유 번호)
-    center: Tuple[float, float]          # 현 프레임 중심 (m)
-    n: int                               # 클러스터 포인트 수
-    age: int = 0                         # "최근 몇 프레임 동안 안 보였는지" 기록하는 카운터
-    history: List[Tuple[float, float]] = field(default_factory=list)        # 과거 프레임들의 중심 좌표 기록 (속도 계산에 사용)
-    speed: float = 0.0                   # 현 프레임 속도 (m/s)
-    just_updated: bool = False           # 이번 프레임에서 실제 매칭되었는지. True → 이번 프레임에 관측된 것, False → 이번엔 관측 실패(예: 가려짐)
-    has_velocity: bool = False           # 속도 값이 유효하게 계산 가능한지 여부(history에 최소 2개 이상의 좌표가 쌓여야 True)
-
-class TrackManager:
-    """
-    매우 단순한 최근접-그리디 매칭 기반 트래커
-    - 이번 프레임의 detection과 기존 트랙을 거리 기준으로 1:1 매칭
-    - 매칭되면 center/속도 갱신, age=0, just_updated=True
-    - 미매칭 트랙은 age+=1, just_updated=False
-    - age>max_age면 제거
-    """
-    def __init__(self, assoc_dist=ASSOC_DIST, max_age=MAX_AGE, dt=DT_SEC):
-        self.tracks: Dict[int, Track] = {}      # 살아있는 트랙들 {tid: Track} 사전
-        self.next_tid: int = 1                  # 다음에 만들 트랙 ID (1부터 증가)
-        self.assoc_dist = assoc_dist            # 매칭 허용 최대 거리(미터). 이보다 멀면 “같은 물체”로 안 봄
-        self.max_age = max_age                  # 미검출 허용 프레임 수. 이를 초과하면 트랙 제거
-        self.dt = dt                            # 프레임 간 시간 간격(초). 속도 계산에 사용
-
-    def _dist(self, p, q):
-        return np.linalg.norm(np.array(p) - np.array(q))
-
-    # 이번 프레임의 검출점(detections)을 기존 트랙들과 최근접 거리 기준으로 1:1 매칭해 각 트랙의 위치·속도·상태를 갱신,
-    # 남은 검출은 새 트랙으로 생성, 오래 미검출된 트랙은 제거
-    def update(self, detections: List[Tuple[float, float]], counts: List[int]) -> List[Track]:
-        # 1) 모든 기존 트랙에 대해 "이번 프레임에 아직 관측되지 않음"으로 초기화하고 나이를 1 올린다.
-        # - age: 몇 프레임 동안 안 보였는지 (가려짐 등)
-        # - just_updated: 이번 프레임에 실제 매칭되었는지 여부
-        for tr in self.tracks.values():
-            tr.age += 1
-            tr.just_updated = False  # 초기화
-
-        # 2) 최근접-그리디 매칭
-        unmatched_det = set(range(len(detections)))     # 아직 어떤 트랙과도 매칭되지 않은 detection 인덱스 집합
-        active = list(self.tracks.items())              # self.tracks.items()의 복사본 (반복 도중 딕셔너리 변경 안전)
-        for tid, tr in active:
-            # best_j = 그 최소 거리를 가진 detection의 인덱스, best_d = 현재 트랙이 가장 가까운 detection까지의 최소 거리
-            best_j, best_d = None, 1e9  # 해당 트랙에 대해 가장 가까운 detection 후보와 거리
-            # 아직 남아있는 detection들과의 거리 중 최소를 찾는다.
-            for j in list(unmatched_det):
-                d = self._dist(tr.center, detections[j])  # 유클리드 거리
-                if d < best_d:
-                    best_d, best_j = d, j
-
-            # 최단거리가 매칭 허용 반경(self.assoc_dist) 이하면 매칭 성립
-            if best_j is not None and best_d <= self.assoc_dist:
-                old = tr.center
-                new = detections[best_j]
-
-                # 위치/크기 갱신 및 이력 저장
-                tr.center = new
-                tr.n = counts[best_j]
-                tr.history.append(new)
-
-                # 속도 계산: '가려짐(age>0)'이면 그만큼 dt를 늘려서 나눔
-                if len(tr.history) >= 2:
-                    gap_frames = tr.age  # update() 맨 앞에서 age를 +1 했으므로 "연속 매칭"이면 gap_frames=1
-                    effective_dt = self.dt * max(1, gap_frames)
-                    tr.speed = self._dist(old, new) / effective_dt
-                    tr.has_velocity = True
-
-                # 매칭되었으니 상태 리셋/표시
-                tr.age = 0
-                tr.just_updated = True
-
-                # 이 detection은 소비 처리(다른 트랙이 또 못 쓰게)
-                unmatched_det.remove(best_j)
-
-        # 3) 남아있는 detection들은 기존 트랙과 매칭되지 못했으므로 "신규 트랙"으로 생성
-        #    - 첫 등장 프레임이라 속도는 아직 정의 불가(has_velocity=False)
-        for j in unmatched_det:
-            c = detections[j]
-            n = counts[j]
-            tr = Track(
-                tid=self.next_tid, center=c, n=n, age=0,
-                history=[c], speed=0.0,
-                just_updated=True,  # 이번 프레임에 관측됨
-                has_velocity=False  # 이전 위치가 없어 속도 미정
-            )
-            self.tracks[self.next_tid] = tr
-            self.next_tid += 1
-
-        # 4) 너무 오래 관측되지 않은 트랙 제거 (유령 트랙 청소)
-        #    - age > self.max_age 인 것만 골라 일괄 삭제
-        dead = [tid for tid, tr in self.tracks.items() if tr.age > self.max_age]
-        for tid in dead:
-            del self.tracks[tid]
-
-        # 현재 활성 트랙 리스트 반환 (상위 로직에서 just_updated/has_velocity를 활용)
-        return list(self.tracks.values())
 
 # ----------------------------------------------------------------------
 # 시각화 헬퍼
@@ -394,7 +300,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────
     velo_root = Path(str(cfg.paths.velo_root)).resolve()
     lbl_root  = Path(str(cfg.paths.lbl_root)).resolve()
-    out_root  = (Path.cwd() / "out_metrics").resolve()
+    out_root = Path(str(cfg.paths.out_root)).resolve()
 
     # ROI(관심 영역)와 격자 해상도: 이후 좌표→셀 인덱스 변환에 사용
     X_MIN, X_MAX = cfg.roi.x_min, cfg.roi.x_max
@@ -863,99 +769,35 @@ def main():
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"[SAVE] {out_dir / 'window_events.jsonl'}")
 
-        # [FINAL] event_type.txt 저장
-        event_txt = out_dir / "event_type.txt"
-        with event_txt.open("w", encoding="utf-8") as f:
-            f.write(f"event_type: {event_type}\n")
-            f.write(f"feats: {repr(feats)}\n")
+        # ----- 최종 결과 저장 -----
+        scorevote_cfg = ScoreVoteConfig(
+            v_ok=6.0,
+            empty_d_th=0.03,
+            a=0.50,
+            b=0.30,
+            c=0.20,
+        )
 
-        print(f"[SAVE] {event_txt}")
+        final_result = aggregate_final_event_scorevote(
+            window_logs=window_logs,
+            cfg=scorevote_cfg,
+        )
 
-        # ----- [ADD] Score-based final event_type (method #3) -----------------------
-        # 붙일 위치: window_logs 다 만든 뒤(=window_events.jsonl 저장 직전/직후) 어디든 OK
-        # 목표: 윈도우별 (density_mean, speed_mean, occupancy_mean)로 점수 계산 →
-        #       구간 전체에서 가중합(argmax)으로 최종 event_type 결정
+        final_result = attach_sequence_summary(
+            result=final_result,
+            seq_event_type=event_type,
+            seq_feats=feats,
+        )
 
-        import math
-        from collections import defaultdict
+        summary_path = save_final_event_scorevote(
+            out_dir=out_dir,
+            result=final_result,
+        )
 
-        def _clip(x, lo=0.0, hi=1.0):
-            return lo if x < lo else hi if x > hi else x
-
-        def _safe_float(x):
-            if x is None:
-                return None
-            try:
-                v = float(x)
-                if math.isnan(v) or math.isinf(v):
-                    return None
-                return v
-            except:
-                return None
-
-        # ---- 가중치(추천 기본값) ----
-        # Congestion 점수 = a*density + b*(1-speed_norm) + c*occupancy
-        # - density(차량 많음)가 제일 핵심 → a 가장 크게
-        # - speed(느림)는 정체의 2번째 증거 → b 중간
-        # - occupancy(체류/정차)는 보조 증거 → c 작게
-        a, b, c = 0.50, 0.30, 0.20
-
-        # speed 정규화 기준 (EncoderConfig.v_ok 기본이 6.0 m/s)
-        # 네 설정에 맞게 바꾸고 싶으면 여기만 바꿔도 됨.
-        V_OK = 6.0
-
-        # Empty 판정용 density 임계치(너 프로젝트에 맞게 대충 안전하게)
-        EMPTY_D_TH = 0.03
-
-        scores_sum = defaultdict(float)  # {"Congestion":..., "Normal":..., "Empty":...}
-        w_sum = 0.0
-
-        for r in window_logs:
-            # 윈도우 길이로 가중 (겹치는 윈도우라도 "지속 구간"이 길면 더 반영)
-            w = int(r.get("end", 0) - r.get("start", 0) + 1)
-            w = max(1, w)
-            w_sum += w
-
-            d = _safe_float(r.get("density_mean"))
-            s = _safe_float(r.get("speed_mean"))
-            o = _safe_float(r.get("occupancy_mean"))
-
-            # 결측 처리: 없으면 중립값으로(안전하게)
-            # - density가 없으면 0
-            # - speed가 없으면 v_ok(=원활)로 간주(정체쪽으로 과하게 안 기울게)
-            # - occupancy가 없으면 0
-            d = _clip(d if d is not None else 0.0)
-            o = _clip(o if o is not None else 0.0)
-
-            if s is None:
-                v_norm = 1.0  # 원활 가정
-            else:
-                v_norm = _clip(s / V_OK)  # 빠를수록 1
-
-            # 점수 정의 (0~1 근처로 유지되게 설계)
-            S_empty = _clip(1.0 - (d / max(EMPTY_D_TH, 1e-6))) if d < EMPTY_D_TH else 0.0
-            S_cong = _clip(a * d + b * (1.0 - v_norm) + c * o)
-            # Normal은 "정체도 아니고 빈 것도 아닌" 잔여 개념으로 두면 설명이 쉬움
-            S_norm = _clip(1.0 - max(S_cong, S_empty))
-
-            scores_sum["Empty"] += w * S_empty
-            scores_sum["Congestion"] += w * S_cong
-            scores_sum["Normal"] += w * S_norm
-
-        final_event = max(scores_sum.items(), key=lambda kv: kv[1])[0]
-        confidence = scores_sum[final_event] / max(1e-9, sum(scores_sum.values()))
-
-        # 저장(논문용으로 바로 복붙 가능한 요약 파일)
-        summary_path = out_dir / "final_event_scorevote.txt"
-        with summary_path.open("w", encoding="utf-8") as f:
-            f.write(f"final_event_type: {final_event}\n")
-            f.write(f"confidence: {confidence:.3f}\n")
-            f.write(f"weights(a,b,c): {a},{b},{c}\n")
-            f.write(f"V_OK: {V_OK}\n")
-            f.write(f"score_sum: {dict(scores_sum)}\n")
-
-        print(f"[FINAL] {final_event} (conf={confidence:.3f}) -> {summary_path}")
-        # ----- [ADD END] ------------------------------------------------------------
+        print(
+            f"[FINAL] {final_result.final_event_type} "
+            f"(conf={final_result.confidence:.3f}) -> {summary_path}"
+        )
 
 
         # e) 기초 결과 저장(샘플/속도/정적)
