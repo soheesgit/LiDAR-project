@@ -11,17 +11,13 @@ from src.event_encoder import EncoderConfig
 from src.final_event_scorevote import ScoreVoteConfig
 from src.event_window import EventWindow
 from src.tracking import TrackManager
-from src.kitti_io import list_pairs, read_bin_xyzr, read_sem_labels
-from src.heatmap_writer import save_map, save_bool_mask
+from src.kitti_io import list_pairs
+from src.heatmap_writer import save_sequence_analysis_maps
 from src.sequence_summary import summarize_sequence
 
 from src.frame_processing import (
     init_sequence_state,
-    apply_roi_filter,
-    build_static_occupancy,
-    apply_static_occupancy,
-    build_vehicle_deltas,
-    apply_vehicle_result,
+    process_frame_step,
 )
 
 # ----------------------------------------------------------------------
@@ -55,14 +51,6 @@ def xy_to_cell(x: np.ndarray, y: np.ndarray, x_min, x_max, y_min, y_max, res):
     m = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H)
 
     return iy, ix, m, H, W
-
-def bev_count(x: np.ndarray, y: np.ndarray, H: int, W: int, x_min, y_min, res):
-    """(선택) 좌표 카운팅 BEV 생성 (여기선 사용 안함)"""
-    bev = np.zeros((H, W), dtype=np.float32)
-    iy, ix, m, _, _ = xy_to_cell(x, y, x_min, x_min + W*res, y_min, y_min + H*res, res)
-    if m.any():
-        np.add.at(bev, (iy[m], ix[m]), 1.0)
-    return bev
 
 # ----------------------------------------------------------------------
 # 클러스터링
@@ -132,22 +120,6 @@ def _parse_frame_spec(spec: Optional[str]) -> Optional[set]:
             frames.add(int(p))
     return frames
 
-def _dbg_print(enabled: bool, msg: str):
-    """디버그 출력 on/off 스위치 (추가)"""
-    if enabled:
-        print(msg)
-
-
-@dataclass
-class FrameProcessResult:
-    roi_count: int
-    occ: np.ndarray
-    dwell_delta: np.ndarray
-    sum_v_delta: np.ndarray
-    sum_v2_delta: np.ndarray
-    cnt_v_delta: np.ndarray
-    obs: list
-
 
 def emit_window_log_if_ready(
     *,
@@ -202,172 +174,6 @@ def emit_window_log_if_ready(
     return row
 
 
-def process_frame(
-    *,
-    t: int,
-    bin_path: Path,
-    lbl_path: Path,
-    state,
-    tracker: TrackManager,
-    H: int,
-    W: int,
-    x_min: float,
-    x_max: float,
-    y_min: float,
-    y_max: float,
-    z_min: float,
-    z_max: float,
-    res: float,
-    vehicle_ids: set,
-    static_ids: set,
-    eps: float,
-    min_samples: int,
-    min_pts: int,
-    chk_first: int,
-    chk_every: int,
-) -> Optional[FrameProcessResult]:
-    pts = read_bin_xyzr(bin_path)
-    sem = read_sem_labels(lbl_path)
-
-    if pts.shape[0] != sem.shape[0]:
-        print(f"  [SKIP] size mismatch at {bin_path.stem}")
-        return None
-
-    roi_frame = apply_roi_filter(
-        pts=pts,
-        sem=sem,
-        x_min=x_min,
-        x_max=x_max,
-        y_min=y_min,
-        y_max=y_max,
-        z_min=z_min,
-        z_max=z_max,
-    )
-    x, y, sem = roi_frame.x, roi_frame.y, roi_frame.sem
-
-    veh_m = np.isin(sem, list(vehicle_ids))
-    static_m = np.isin(sem, list(static_ids))
-
-    do_chk = (t < chk_first) or (chk_every > 0 and (t % chk_every == 0))
-    if do_chk:
-        print(
-            f"[CHK t={t}] roi_pts={len(x)} veh_pts={int(veh_m.sum())} static_pts={int(static_m.sum())}"
-        )
-
-    # c) 정적 occupancy 생성
-    occ = build_static_occupancy(
-        x=x,
-        y=y,
-        sem=sem,
-        static_ids=static_ids,
-        H=H,
-        W=W,
-        x_min=x_min,
-        x_max=x_max,
-        y_min=y_min,
-        y_max=y_max,
-        res=res,
-        xy_to_cell_fn=xy_to_cell,
-    )
-    apply_static_occupancy(state, occ)
-
-    # d) 차량 delta 생성 (항상 실행)
-    veh_result = build_vehicle_deltas(
-        x=x,
-        y=y,
-        sem=sem,
-        vehicle_ids=vehicle_ids,
-        H=H,
-        W=W,
-        x_min=x_min,
-        x_max=x_max,
-        y_min=y_min,
-        y_max=y_max,
-        res=res,
-        tracker=tracker,
-        cluster_vehicle_xy_fn=cluster_vehicle_xy,
-        xy_to_cell_fn=xy_to_cell,
-        eps=eps,
-        min_samples=min_samples,
-        min_pts=min_pts,
-    )
-    apply_vehicle_result(state, veh_result)
-
-    dwell_delta = veh_result.dwell_delta
-    sum_v_delta = veh_result.sum_v_delta
-    sum_v2_delta = veh_result.sum_v2_delta
-    cnt_v_delta = veh_result.cnt_v_delta
-    obs = veh_result.obs
-    roi_count = veh_result.roi_count
-    seen_tid = veh_result.seen_tid
-
-    if do_chk:
-        print(
-            f"[CHK t={t}] clusters={veh_result.cluster_count} "
-            f"centers={len(veh_result.centers)} "
-            f"(eps={eps}, min_samples={min_samples}, min_pts={min_pts})"
-        )
-        print(
-            f"[CHK t={t}] tracks_alive={len(tracker.tracks)} "
-            f"updated={veh_result.updated_track_count}"
-        )
-
-        nz = int(np.count_nonzero(dwell_delta))
-        nz_cntv = int(np.count_nonzero(cnt_v_delta))
-        print(
-            f"[CHK t={t}] roi_count={roi_count} seen_tid={len(seen_tid)} "
-            f"dwell_delta_nz={nz} cnt_v_delta_nz={nz_cntv}"
-        )
-
-    m_cnt = (cnt_v_delta > 0)
-    n_cnt = int(np.sum(m_cnt))
-    n_sum_finite = int(np.sum(np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
-    n_sum_zero = int(np.sum(sum_v_delta[m_cnt] == 0.0)) if n_cnt > 0 else 0
-    n_sum_bad = int(np.sum(~np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
-
-    if n_cnt > 0 and np.isfinite(sum_v_delta[m_cnt]).any():
-        approx_vals = sum_v_delta[m_cnt & (cnt_v_delta == 1)]
-        approx_vals = approx_vals[np.isfinite(approx_vals)]
-        if approx_vals.size > 0:
-            v_lo = float(np.min(approx_vals))
-            v_hi = float(np.max(approx_vals))
-        else:
-            v_lo = v_hi = float("nan")
-    else:
-        v_lo = v_hi = float("nan")
-
-    print(
-        f"[DBG][t={t}] delta cnt_cells={n_cnt}, sum_finite={n_sum_finite}, "
-        f"sum_zero={n_sum_zero}, sum_bad={n_sum_bad}, approx_v_range=[{v_lo:.3f},{v_hi:.3f}]"
-    )
-
-    return FrameProcessResult(
-        roi_count=roi_count,
-        occ=occ,
-        dwell_delta=dwell_delta,
-        sum_v_delta=sum_v_delta,
-        sum_v2_delta=sum_v2_delta,
-        cnt_v_delta=cnt_v_delta,
-        obs=obs,
-    )
-
-
-def save_sequence_outputs(
-    *,
-    out_dir: Path,
-    window_logs: list,
-):
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    import json
-
-    with (out_dir / "window_events.jsonl").open("w", encoding="utf-8") as f:
-        for r in window_logs:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    print(f"[SAVE] {out_dir / 'window_events.jsonl'}")
-
-
 def run_sequence(
     *,
     pairs: list,
@@ -399,7 +205,7 @@ def run_sequence(
     window_logs = []
 
     for t, (bin_path, lbl_path) in enumerate(pairs):
-        fr = process_frame(
+        fr = process_frame_step(
             t=t,
             bin_path=bin_path,
             lbl_path=lbl_path,
@@ -421,6 +227,8 @@ def run_sequence(
             min_pts=min_pts,
             chk_first=chk_first,
             chk_every=chk_every,
+            xy_to_cell_fn=xy_to_cell,
+            cluster_vehicle_xy_fn=cluster_vehicle_xy,
         )
 
         if fr is None:
@@ -450,6 +258,7 @@ def run_sequence(
             print("[WIN]", row)
 
     return window_logs
+
 
 # ----------------------------------------------------------------------
 # 메인
@@ -685,91 +494,32 @@ def main():
             enc_debug=enc_debug,
         )
 
-        save_sequence_outputs(
-            out_dir=out_dir,
-            window_logs=window_logs,
-        )
-
         mean_v = summary.mean_v
         std_v = summary.std_v
         unique_cnt = summary.unique_cnt
         static_change_rate = summary.static_change_rate
 
-
-        # e) 기초 결과 저장(샘플/속도/정적)
-        save_map(out_dir / "speed_samples.png",
-                 f"{seq} speed samples per cell", state.cnt_v.astype(float))
-
-        # 신뢰 셀 정의(분류/표시에서 사용할 마스크)
-        reliable = (state.cnt_v >= SPEED_MIN_SAMPLES)
-
-        # "신뢰 셀만" 남긴 표준편차 히트맵(디버깅용)
-        std_masked = np.where(reliable, std_v, np.nan)
-        save_map(out_dir / "std_speed_masked.png",
-                 f"{seq} std speed (n>={SPEED_MIN_SAMPLES})", std_masked, vmin=0.0, vmax=STD_VMAX)
-
-        # stop&go 강조: 평균이 느린 셀에서의 std
-        stopngo = np.where(reliable & (mean_v <= V_SLOW), std_v, np.nan)
-        save_map(out_dir / "stopngo.png",
-                 f"{seq} stop&go (std where mean<={V_SLOW} m/s)", stopngo, vmin=0.0, vmax=STD_VMAX)
-
-        # 기타 기본 히트맵 저장
-        save_map(out_dir / "unique_ids.png", f"{seq} unique track IDs", unique_cnt.astype(float))
-        save_map(out_dir / "dwell.png",      f"{seq} dwell (frames)",    state.dwell.astype(float))
-        save_map(out_dir / "mean_speed.png", f"{seq} mean speed (m/s)",  mean_v, vmin=0.0, vmax=SPEED_VMAX)
-        save_map(out_dir / "std_speed.png",  f"{seq} std speed (m/s)",   std_v,  vmin=0.0, vmax=STD_VMAX)
-
-        # 정적 채널 저장
-        save_map(out_dir / "static_dwell.png",
-                 f"{seq} static dwell (frames)", state.static_dwell.astype(float))
-        save_map(out_dir / "static_change_rate.png",
-                 f"{seq} static change rate", static_change_rate, vmin=0.0, vmax=None)
-
-        # f) 상태별 마스크 생성
-        ego_stop_mask = reliable & (mean_v <= V_SLOW) & (static_change_rate <= SC_LOW) & (state.static_dwell >= 1)
-        congestion_mask = reliable & (mean_v <= V_SLOW) & (state.dwell >= DWELL_HIGH) & (unique_cnt <= UID_LOW)
-        stopngo_mask = reliable & (mean_v <= V_SLOW) & (std_v >= STD_HIGH)
-        freeflow_mask = reliable & (mean_v >= V_FAST) & (std_v < STD_HIGH) \
-                        & (unique_cnt > UID_LOW) & (static_change_rate >= SC_HIGH)
-        slowmoving_mask = reliable & (mean_v > SLOW_MIN) & (mean_v <= SLOW_MAX) \
-                          & (static_change_rate <= SC_HIGH)
-
-        save_bool_mask(out_dir / "ego_stop_mask.png",   f"{seq} ego-stop mask",   ego_stop_mask)
-        save_bool_mask(out_dir / "congestion_mask.png", f"{seq} congestion mask", congestion_mask)
-        save_bool_mask(out_dir / "stopngo_mask.png",    f"{seq} stop&go mask",    stopngo_mask)
-        save_bool_mask(out_dir / "freeflow_mask.png",   f"{seq} freeflow mask",   freeflow_mask)
-        save_bool_mask(out_dir / "slowmoving_mask.png", f"{seq} slow-moving mask", slowmoving_mask)
-
-        # h) 최종 클래스맵(우선순위 적용: ego-stop > congestion > stop&go > slow-moving > free)
-        #    unlabeled=255 → 시각화 시 NaN 처리하여 컬러바 충돌 방지
-        final_cls = np.full((H, W), 255, dtype=np.uint8)
-
-        # 1) 기본은 free(0)로 채우되, 신뢰 셀만 free로 표기 (신뢰 아님은 unlabeled 유지)
-        final_cls[reliable] = 0
-        final_cls[slowmoving_mask] = 4
-        final_cls[stopngo_mask] = 3
-        final_cls[congestion_mask] = 2
-        final_cls[ego_stop_mask] = 1
-
-        # 2) 우선순위 낮은 것부터 덮어쓰기
-        final_cls[slowmoving_mask] = 4  # free < slow-moving
-        final_cls[stopngo_mask] = 3  # slow-moving < stop&go
-        final_cls[congestion_mask] = 2  # stop&go < congestion
-        final_cls[ego_stop_mask] = 1  # congestion < ego-stop  (최우선)
-
-        # 시각화를 위해 255를 NaN으로
-        final_vis = final_cls.astype(np.float32)
-        final_vis[final_vis == 255] = np.nan
-        save_map(out_dir / "final_classmap.png",
-                 f"{seq} final classmap (0=free,1=ego,2=cong,3=s&g,4=slow)", final_vis, vmin=0, vmax=4)
-
-        # i) 요약 통계
-        sampled_mask = (state.cnt_v > 0)
-        total_cells = int(np.sum(sampled_mask))
-        print(f"  [SUMMARY] cells with speed samples: {total_cells}")
-        if total_cells > 0:
-            print(f"           mean(speed) over sampled cells = {float(np.nanmean(mean_v[sampled_mask])):.2f} m/s")
-            print(f"           median(speed) over sampled cells = {float(np.nanmedian(mean_v[sampled_mask])):.2f} m/s")
+        save_sequence_analysis_maps(
+            seq=seq,
+            out_dir=out_dir,
+            state=state,
+            mean_v=mean_v,
+            std_v=std_v,
+            unique_cnt=unique_cnt,
+            static_change_rate=static_change_rate,
+            speed_min_samples=SPEED_MIN_SAMPLES,
+            v_slow=V_SLOW,
+            v_fast=V_FAST,
+            std_high=STD_HIGH,
+            dwell_high=DWELL_HIGH,
+            uid_low=UID_LOW,
+            sc_low=SC_LOW,
+            sc_high=SC_HIGH,
+            slow_min=SLOW_MIN,
+            slow_max=SLOW_MAX,
+            std_vmax=STD_VMAX,
+            speed_vmax=SPEED_VMAX,
+        )
 
 if __name__ == "__main__":
     main()

@@ -11,6 +11,7 @@ from src.final_event_scorevote import (
     aggregate_final_event_scorevote,
     attach_sequence_summary,
     save_final_event_scorevote,
+    save_window_events_jsonl,
 )
 
 
@@ -160,3 +161,40 @@ def summarize_sequence(
         final_result=final_result,
         summary_path=summary_path,
     )
+
+def save_sequence_summary_outputs(
+    *,
+    out_dir: Path,
+    window_logs: List[Dict[str, object]],
+    seq_event_type: str,
+    seq_feats: Dict[str, object],
+    scorevote_cfg: Optional[ScoreVoteConfig] = None,
+) -> Dict[str, object]:
+    scorevote_cfg = scorevote_cfg or ScoreVoteConfig()
+
+    window_jsonl_path = save_window_events_jsonl(
+        out_dir=out_dir,
+        window_logs=window_logs,
+    )
+
+    final_result = aggregate_final_event_scorevote(
+        window_logs=window_logs,
+        cfg=scorevote_cfg,
+    )
+
+    final_result = attach_sequence_summary(
+        result=final_result,
+        seq_event_type=seq_event_type,
+        seq_feats=seq_feats,
+    )
+
+    final_txt_path = save_final_event_scorevote(
+        out_dir=out_dir,
+        result=final_result,
+    )
+
+    return {
+        "window_jsonl_path": window_jsonl_path,
+        "final_txt_path": final_txt_path,
+        "final_result": final_result,
+    }

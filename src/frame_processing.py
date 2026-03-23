@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional
+from pathlib import Path
 import numpy as np
 
 from src.tracking import TrackManager
-
+from src.kitti_io import read_bin_xyzr, read_sem_labels
 
 @dataclass
 class RoiFrame:
@@ -39,6 +40,167 @@ class VehicleDeltaResult:
     sizes: list[int]
     cluster_count: int
     updated_track_count: int
+
+
+@dataclass
+class FrameProcessStepResult:
+    roi_count: int
+    occ: np.ndarray
+    dwell_delta: np.ndarray
+    sum_v_delta: np.ndarray
+    sum_v2_delta: np.ndarray
+    cnt_v_delta: np.ndarray
+    obs: list
+
+
+def process_frame_step(
+    *,
+    t: int,
+    bin_path: Path,
+    lbl_path: Path,
+    state: SequenceState,
+    tracker,
+    H: int,
+    W: int,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    z_min: float,
+    z_max: float,
+    res: float,
+    vehicle_ids: set,
+    static_ids: set,
+    eps: float,
+    min_samples: int,
+    min_pts: int,
+    chk_first: int,
+    chk_every: int,
+    xy_to_cell_fn,
+    cluster_vehicle_xy_fn,
+) -> Optional[FrameProcessStepResult]:
+    pts = read_bin_xyzr(bin_path)
+    sem = read_sem_labels(lbl_path)
+
+    if pts.shape[0] != sem.shape[0]:
+        print(f"  [SKIP] size mismatch at {bin_path.stem}")
+        return None
+
+    roi_frame = apply_roi_filter(
+        pts=pts,
+        sem=sem,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        z_min=z_min,
+        z_max=z_max,
+    )
+    x, y, sem = roi_frame.x, roi_frame.y, roi_frame.sem
+
+    veh_m = np.isin(sem, list(vehicle_ids))
+    static_m = np.isin(sem, list(static_ids))
+
+    do_chk = (t < chk_first) or (chk_every > 0 and (t % chk_every == 0))
+    if do_chk:
+        print(
+            f"[CHK t={t}] roi_pts={len(x)} veh_pts={int(veh_m.sum())} static_pts={int(static_m.sum())}"
+        )
+
+    occ = build_static_occupancy(
+        x=x,
+        y=y,
+        sem=sem,
+        static_ids=static_ids,
+        H=H,
+        W=W,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        res=res,
+        xy_to_cell_fn=xy_to_cell_fn,
+    )
+    apply_static_occupancy(state, occ)
+
+    veh_result = build_vehicle_deltas(
+        x=x,
+        y=y,
+        sem=sem,
+        vehicle_ids=vehicle_ids,
+        H=H,
+        W=W,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        res=res,
+        tracker=tracker,
+        cluster_vehicle_xy_fn=cluster_vehicle_xy_fn,
+        xy_to_cell_fn=xy_to_cell_fn,
+        eps=eps,
+        min_samples=min_samples,
+        min_pts=min_pts,
+    )
+    apply_vehicle_result(state, veh_result)
+
+    dwell_delta = veh_result.dwell_delta
+    sum_v_delta = veh_result.sum_v_delta
+    sum_v2_delta = veh_result.sum_v2_delta
+    cnt_v_delta = veh_result.cnt_v_delta
+    obs = veh_result.obs
+    roi_count = veh_result.roi_count
+    seen_tid = veh_result.seen_tid
+
+    if do_chk:
+        print(
+            f"[CHK t={t}] clusters={veh_result.cluster_count} "
+            f"centers={len(veh_result.centers)} "
+            f"(eps={eps}, min_samples={min_samples}, min_pts={min_pts})"
+        )
+        print(
+            f"[CHK t={t}] tracks_alive={len(tracker.tracks)} "
+            f"updated={veh_result.updated_track_count}"
+        )
+
+        nz = int(np.count_nonzero(dwell_delta))
+        nz_cntv = int(np.count_nonzero(cnt_v_delta))
+        print(
+            f"[CHK t={t}] roi_count={roi_count} seen_tid={len(seen_tid)} "
+            f"dwell_delta_nz={nz} cnt_v_delta_nz={nz_cntv}"
+        )
+
+    m_cnt = (cnt_v_delta > 0)
+    n_cnt = int(np.sum(m_cnt))
+    n_sum_finite = int(np.sum(np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
+    n_sum_zero = int(np.sum(sum_v_delta[m_cnt] == 0.0)) if n_cnt > 0 else 0
+    n_sum_bad = int(np.sum(~np.isfinite(sum_v_delta[m_cnt]))) if n_cnt > 0 else 0
+
+    if n_cnt > 0 and np.isfinite(sum_v_delta[m_cnt]).any():
+        approx_vals = sum_v_delta[m_cnt & (cnt_v_delta == 1)]
+        approx_vals = approx_vals[np.isfinite(approx_vals)]
+        if approx_vals.size > 0:
+            v_lo = float(np.min(approx_vals))
+            v_hi = float(np.max(approx_vals))
+        else:
+            v_lo = v_hi = float("nan")
+    else:
+        v_lo = v_hi = float("nan")
+
+    print(
+        f"[DBG][t={t}] delta cnt_cells={n_cnt}, sum_finite={n_sum_finite}, "
+        f"sum_zero={n_sum_zero}, sum_bad={n_sum_bad}, approx_v_range=[{v_lo:.3f},{v_hi:.3f}]"
+    )
+
+    return FrameProcessStepResult(
+        roi_count=roi_count,
+        occ=occ,
+        dwell_delta=dwell_delta,
+        sum_v_delta=sum_v_delta,
+        sum_v2_delta=sum_v2_delta,
+        cnt_v_delta=cnt_v_delta,
+        obs=obs,
+    )
 
 
 def init_sequence_state(H: int, W: int) -> SequenceState:
