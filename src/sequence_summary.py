@@ -68,16 +68,6 @@ def compute_static_change_rate(static_change_count: np.ndarray, num_frames: int)
     return static_change_count.astype(np.float32) / float(t_eff)
 
 
-def save_window_events_jsonl(out_dir: Path, window_logs: list[dict]) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "window_events.jsonl"
-    with path.open("w", encoding="utf-8") as f:
-        for row in window_logs:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"[SAVE] {path}")
-    return path
-
-
 def summarize_sequence(
     *,
     state,
