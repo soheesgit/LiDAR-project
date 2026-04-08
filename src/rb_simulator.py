@@ -26,14 +26,14 @@ import numpy as np
 @dataclass
 class SimConfig:
     # 무선 자원 설정
-    total_rb: int = 50
+    total_rb: int = 12
     bandwidth_per_rb_hz: float = 180_000.0
     slot_sec: float = 0.1
     n_slots: int = 300
 
     # 간단 채널 모델용 전력/잡음
     tx_power: float = 1.0
-    noise_power: float = 1e-9
+    noise_power: float = 0.01
 
     # 트래픽 모델
     packet_size_bits: int = 2_000
@@ -51,9 +51,9 @@ class SimConfig:
     pf_epsilon: float = 1e-6
 
     # Ours 가중치
-    weight_congestion: float = 2.0
+    weight_congestion: float = 3.0
     weight_normal: float = 1.0
-    weight_empty: float = 0.5
+    weight_empty: float = 0.3
 
     # 디버그 옵션
     debug_slots: int = 10
@@ -122,19 +122,19 @@ def normalize_state_name(state: str) -> str:
 # - gain_mu / gain_sigma: lognormal 채널 gain 분포 파라미터
 STATE_ENV: Dict[str, Dict[str, float]] = {
     "Congestion": {
-        "arrival_pkts": 35.0,
-        "gain_mu": -2.0,
-        "gain_sigma": 0.75,
+        "arrival_pkts": 10.0,
+        "gain_mu": -3.0,
+        "gain_sigma": 0.8,
     },
     "Normal": {
-        "arrival_pkts": 20.0,
-        "gain_mu": -0.8,
-        "gain_sigma": 0.45,
+        "arrival_pkts": 6.0,
+        "gain_mu": -1.0,
+        "gain_sigma": 0.5,
     },
     "Empty": {
-        "arrival_pkts": 10.0,
-        "gain_mu": -0.2,
-        "gain_sigma": 0.30,
+        "arrival_pkts": 3.0,
+        "gain_mu": 0.0,
+        "gain_sigma": 0.3,
     },
 }
 
@@ -401,7 +401,7 @@ def alloc_ours_weighted_by_state(
 
     for i, v in enumerate(vehicles):
         if active_mask[i] and v.queue_bits > 0:
-            queue_urgency = 1.0 + 0.3 * (v.queue_bits / max(cfg.packet_size_bits, 1.0))
+            queue_urgency = 1.0 + 1.0 * (v.queue_bits / max(cfg.packet_size_bits, 1.0))
             rate_factor = rate_per_rb[i] / max_rate
             scores[i] = state_weight(v.state, cfg) * queue_urgency * (0.5 + 0.5 * rate_factor)
         else:
@@ -428,7 +428,7 @@ def alloc_ours_pf_hybrid(
     for i, v in enumerate(vehicles):
         if active_mask[i] and v.queue_bits > 0:
             pf = rate_per_rb[i] / max(avg_thr[i], cfg.pf_epsilon)
-            state_bonus = 1.0 + 0.3 * (state_weight(v.state, cfg) - 1.0)
+            state_bonus = state_weight(v.state, cfg)
             scores[i] = pf * state_bonus
         else:
             scores[i] = 0.0
@@ -573,7 +573,8 @@ def simulate_once(
         else:
             raise ValueError(f"Unknown scheduler: {scheduler_name}")
 
-        alloc_rb = cap_allocation_by_request(alloc_rb, requested_rb)
+        if scheduler_name not in ("Ours", "OursPF"):
+            alloc_rb = cap_allocation_by_request(alloc_rb, requested_rb)
 
         served_bits_arr = serve_queues(vehicles, alloc_rb, rate_per_rb, cfg)
         queue_after = np.array([v.queue_bits for v in vehicles], dtype=np.float64)
