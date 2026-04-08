@@ -26,7 +26,7 @@ import numpy as np
 @dataclass
 class SimConfig:
     # 무선 자원 설정
-    total_rb: int = 12
+    total_rb: int = 50
     bandwidth_per_rb_hz: float = 180_000.0
     slot_sec: float = 0.1
     n_slots: int = 300
@@ -36,7 +36,7 @@ class SimConfig:
     noise_power: float = 1e-9
 
     # 트래픽 모델
-    packet_size_bits: int = 12_000
+    packet_size_bits: int = 2_000
 
     # 차량 수
     n_vehicles: int = 60
@@ -393,38 +393,25 @@ def alloc_ours_weighted_by_state(
     vehicles: List[Vehicle],
     rate_per_rb: np.ndarray,
     cfg: SimConfig,
+    active_mask: np.ndarray,
 ) -> np.ndarray:
     scores = np.zeros(len(vehicles), dtype=np.float64)
 
     max_rate = float(np.max(rate_per_rb)) if np.max(rate_per_rb) > 0 else 1.0
 
     for i, v in enumerate(vehicles):
-        if v.queue_bits > 0:
+        if active_mask[i] and v.queue_bits > 0:
             queue_urgency = 1.0 + 0.3 * (v.queue_bits / max(cfg.packet_size_bits, 1.0))
             rate_factor = rate_per_rb[i] / max_rate
             scores[i] = state_weight(v.state, cfg) * queue_urgency * (0.5 + 0.5 * rate_factor)
         else:
             scores[i] = 0.0
 
-    alloc = np.zeros(len(vehicles), dtype=np.int32)
-    active_idx = [i for i, v in enumerate(vehicles) if v.queue_bits > 0]
+    if np.sum(scores) <= 0:
+        return np.zeros(len(vehicles), dtype=np.int32)
 
-    # 1차: active user에 최소 1RB 보장
-    first_round = min(len(active_idx), total_rb)
-    order = np.argsort(-scores)
-    guaranteed = [i for i in order if vehicles[i].queue_bits > 0][:first_round]
-    for i in guaranteed:
-        alloc[i] += 1
-
-    remain = total_rb - first_round
-    if remain <= 0:
-        return alloc
-
-    # 이미 1RB 받은 사용자도 포함해서 남은 RB를 점수 비례 분배
-    if np.sum(scores) > 0:
-        extra_alloc = proportional_integer_allocation(remain, scores)
-        alloc += extra_alloc
-
+    # 전체 RB를 점수 비례로 직접 배분 (1RB 보장 단계 제거)
+    alloc = proportional_integer_allocation(total_rb, scores)
     return alloc
 
 
@@ -434,36 +421,23 @@ def alloc_ours_pf_hybrid(
     rate_per_rb: np.ndarray,
     avg_thr: np.ndarray,
     cfg: SimConfig,
+    active_mask: np.ndarray,
 ) -> np.ndarray:
     scores = np.zeros(len(vehicles), dtype=np.float64)
 
     for i, v in enumerate(vehicles):
-        if v.queue_bits > 0:
+        if active_mask[i] and v.queue_bits > 0:
             pf = rate_per_rb[i] / max(avg_thr[i], cfg.pf_epsilon)
             state_bonus = 1.0 + 0.3 * (state_weight(v.state, cfg) - 1.0)
             scores[i] = pf * state_bonus
         else:
             scores[i] = 0.0
 
-    alloc = np.zeros(len(vehicles), dtype=np.int32)
-    active_idx = [i for i, v in enumerate(vehicles) if v.queue_bits > 0]
+    if np.sum(scores) <= 0:
+        return np.zeros(len(vehicles), dtype=np.int32)
 
-    # active user에 최소 1RB 보장
-    first_round = min(len(active_idx), total_rb)
-    order = np.argsort(-scores)
-    guaranteed = [i for i in order if vehicles[i].queue_bits > 0][:first_round]
-    for i in guaranteed:
-        alloc[i] += 1
-
-    remain = total_rb - first_round
-    if remain <= 0:
-        return alloc
-
-    # 남은 RB는 점수 비례 분배
-    if np.sum(scores) > 0:
-        extra_alloc = proportional_integer_allocation(remain, scores)
-        alloc += extra_alloc
-
+    # 전체 RB를 점수 비례로 직접 배분 (1RB 보장 단계 제거)
+    alloc = proportional_integer_allocation(total_rb, scores)
     return alloc
 
 
@@ -585,6 +559,7 @@ def simulate_once(
                 vehicles,
                 rate_per_rb,
                 cfg,
+                active_mask,
             )
         elif scheduler_name == "OursPF":
             alloc_rb = alloc_ours_pf_hybrid(
@@ -593,6 +568,7 @@ def simulate_once(
                 rate_per_rb,
                 avg_thr,
                 cfg,
+                active_mask,
             )
         else:
             raise ValueError(f"Unknown scheduler: {scheduler_name}")
