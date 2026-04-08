@@ -1,12 +1,15 @@
+# sequence_summary.py
+# 전체 시퀀스 누적 맵으로 시퀀스-level feature를 계산하고, window 로그를 최종 scorevote 결과와 연결해 저장
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import json
 import numpy as np
+from typing import List, Dict, Optional
 
-from src.event_encoder import encode_event_type, EncoderConfig
-from src.final_event_scorevote import (
+from event_encoder import encode_event_type, EncoderConfig
+from final_event_scorevote import (
     ScoreVoteConfig,
     aggregate_final_event_scorevote,
     attach_sequence_summary,

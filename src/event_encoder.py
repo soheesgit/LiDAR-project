@@ -1,3 +1,6 @@
+# event_encoder.py
+# density, speed, occupancy, static 변화 등을 바탕으로 윈도우/시퀀스 상태 판정하는 핵심 규칙 인코더
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,7 +8,7 @@ from typing import Dict, Tuple, Optional, Any
 import numpy as np
 import os
 
-from src.encoder_utils import (
+from encoder_utils import (
     _safe_nanmean,
     _normalize_01,
     _topk_mask,
@@ -742,13 +745,14 @@ def encode_event_type(
     debug: Optional[bool] = None,
     debug_tag: str = "",
 ) -> Tuple[str, Dict[str, float]]:
+
+    if cfg is None:
+        cfg = EncoderConfig()
+
     if debug is None:
         env_flag = str(os.getenv("EVENT_ENC_DEBUG", "")).strip().lower()
         env_debug = env_flag in ("1", "true", "yes", "y", "on")
         debug = bool(cfg.debug or env_debug)
-
-    if cfg is None:
-        cfg = EncoderConfig()
 
     dbg_print_on = bool(debug and cfg.debug_print)
     dbg: Dict[str, float] = {}

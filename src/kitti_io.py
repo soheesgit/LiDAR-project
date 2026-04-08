@@ -1,3 +1,6 @@
+# kitti_io.py
+# KITTI/semanticKITTI의 .bin과 .label 파일을 읽고 서로 짝지음
+
 from __future__ import annotations
 
 from pathlib import Path

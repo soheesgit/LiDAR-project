@@ -1,4 +1,6 @@
-# src/event_window.py
+# event_window.py
+# 최근 N프레임의 누적 통계를 슬라이딩 윈도우로 유지하면서 window 단위 이벤트와 feature를 뽑아주는 클래스
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +11,7 @@ import numpy as np
 
 # EncoderConfig: 이벤트 판정에 쓰는 각종 임계치/정규화 파라미터 모음
 # encode_event: 누적된 윈도우 통계를 입력받아 (event_type, feats) 반환
-from src.event_encoder import EncoderConfig, encode_event
+from event_encoder import EncoderConfig, encode_event
 
 
 @dataclass

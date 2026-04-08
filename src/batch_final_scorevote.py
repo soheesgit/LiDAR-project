@@ -1,3 +1,6 @@
+# batch_final_scorevote.py
+# 시퀀스 00~10을 여러 프레임 구간으로 잘라 heatmap_accum.py를 배치 실행, 끝나면 CSV 요약까지 모아주는 배치 실행기
+
 from __future__ import annotations
 
 import subprocess
@@ -40,6 +43,7 @@ def main():
     project_root = Path(r"D:\연구실\new_hitmap_ver")
     py_exe = project_root / ".venv" / "Scripts" / "python.exe"
     script = project_root / "src" / "heatmap_accum.py"
+    collect_script = project_root / "src" / "collect_final_event_types.py"
 
     base_cfg = project_root / "src" / "config.yaml"
     velo_root = Path(r"D:\dataset\sequences")
@@ -49,6 +53,10 @@ def main():
     seqs = [f"{i:02d}" for i in range(11)]   # 00 ~ 10
     window_len = 300
     hop = 100
+
+    total_runs = 0
+    success_runs = 0
+    fail_runs = 0
 
     for seq in seqs:
         velo_dir = velo_root / seq / "velodyne"
@@ -62,6 +70,8 @@ def main():
         print(f"\n[SEQ] {seq} total_frames={n_frames} n_ranges={len(ranges)}")
 
         for start, end in ranges:
+            total_runs += 1
+
             run_name = f"{start:06d}_{end:06d}"
             run_out_dir = out_root / seq / run_name
             temp_cfg_path = temp_cfg_dir / f"config_{seq}_{run_name}.yaml"
@@ -85,9 +95,28 @@ def main():
             result = subprocess.run(cmd, cwd=str(project_root))
 
             if result.returncode != 0:
+                fail_runs += 1
                 print(f"[FAIL] seq={seq} range=[{start}..{end}] code={result.returncode}")
             else:
+                success_runs += 1
                 print(f"[OK]   seq={seq} range=[{start}..{end}] -> {run_out_dir}")
+
+    print("\n[BATCH SUMMARY]")
+    print(f"total_runs   = {total_runs}")
+    print(f"success_runs = {success_runs}")
+    print(f"fail_runs    = {fail_runs}")
+
+    print("\n[POST] collecting CSV summaries...")
+    collect_cmd = [
+        str(py_exe),
+        str(collect_script),
+    ]
+    collect_result = subprocess.run(collect_cmd, cwd=str(project_root))
+
+    if collect_result.returncode != 0:
+        print(f"[FAIL] collect_final_event_types.py code={collect_result.returncode}")
+    else:
+        print("[OK] CSV summary collection finished.")
 
 
 if __name__ == "__main__":

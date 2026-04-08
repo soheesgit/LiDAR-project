@@ -1,3 +1,6 @@
+# heatmap_accum.py
+# 전체 파이프라인 메인, 프레임들 돌며 누적/윈도우 로그/시퀀스 요약/히트맵 저장
+
 from __future__ import annotations
 from pathlib import Path
 import argparse
@@ -6,16 +9,16 @@ from typing import List, Optional
 from sklearn.cluster import DBSCAN
 from dataclasses import dataclass
 
-from src.config import load_config, resolve_config_path
-from src.event_encoder import EncoderConfig
-from src.final_event_scorevote import ScoreVoteConfig
-from src.event_window import EventWindow
-from src.tracking import TrackManager
-from src.kitti_io import list_pairs
-from src.heatmap_writer import save_sequence_analysis_maps
-from src.sequence_summary import summarize_sequence
+from config import load_config, resolve_config_path
+from event_encoder import EncoderConfig
+from final_event_scorevote import ScoreVoteConfig
+from event_window import EventWindow
+from tracking import TrackManager
+from kitti_io import list_pairs
+from heatmap_writer import save_sequence_analysis_maps
+from sequence_summary import summarize_sequence
 
-from src.frame_processing import (
+from frame_processing import (
     init_sequence_state,
     process_frame_step,
 )
@@ -408,9 +411,10 @@ def main():
         STRIDE = 10
 
         enc_cfg_win = EncoderConfig(
-            density_cap_cell=2.0,
+            density_cap_cell=3.0,
             cell_size_m=RES,
             n_frames=WIN_N,  # 윈도우 기준
+            roi_cap_vehicles=40.0,
             v_low=2.0,
             v_ok=6.0,
             occ_high=0.6,
@@ -472,7 +476,7 @@ def main():
             window_logs=window_logs,
             out_dir=out_dir,
             enc_cfg=EncoderConfig(
-                density_cap_cell=0.3,
+                density_cap_cell=3.0,
                 cell_size_m=0.8,
                 n_frames=301,
                 v_low=2.0,
@@ -490,6 +494,7 @@ def main():
                 a=0.50,
                 b=0.30,
                 c=0.20,
+                force_congestion_run=2,
             ),
             enc_debug=enc_debug,
         )

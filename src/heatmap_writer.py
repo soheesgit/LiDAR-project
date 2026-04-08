@@ -1,3 +1,6 @@
+# heatmap_writer.py
+# mean speed, std, dwell, class mask 같은 분석 결과를 PNG 히트맵으로 저장
+
 from __future__ import annotations
 
 from pathlib import Path

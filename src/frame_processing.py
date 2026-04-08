@@ -1,3 +1,6 @@
+# frame_processing.py
+# 프레임 1장 읽어 ROI 필터링, 정적 occupancy 생성, 차량 클러스터링/트래킹 반영, delta 맵 생성을 담당하는 프레임 처리 모듈
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,8 +8,8 @@ from typing import Iterable, Optional
 from pathlib import Path
 import numpy as np
 
-from src.tracking import TrackManager
-from src.kitti_io import read_bin_xyzr, read_sem_labels
+from tracking import TrackManager
+from kitti_io import read_bin_xyzr, read_sem_labels
 
 @dataclass
 class RoiFrame:

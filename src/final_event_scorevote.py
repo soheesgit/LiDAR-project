@@ -1,3 +1,6 @@
+# final_event_scorevote.py
+# 여러 window의 점수를 합산해서 구간 최종 상태 결정, final_event_scorevote.txt를 저장
+
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -37,6 +40,13 @@ class ScoreVoteConfig:
     a: float = 0.50
     b: float = 0.30
     c: float = 0.20
+
+    force_congestion_run: int = 2
+    force_density_min: float = 0.60
+    force_speed_max: float = 1.0
+    force_occupancy_min: float = 0.10
+    force_stopped_ratio_min: float = 0.50
+    force_raw_min_count: int = 2
 
 
 @dataclass
@@ -84,6 +94,34 @@ def compute_window_scores (
     }
 
 
+def _max_congestion_run(window_logs: List[Dict[str, object]]) -> int:
+    best = 0
+    cur = 0
+
+    for row in window_logs:
+        if str(row.get("event_type", "")).strip() == "Congestion":
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+
+    return best
+
+
+def _is_raw_congestion_row(row, cfg: ScoreVoteConfig) -> bool:
+    density = _safe_float(row.get("density_mean"))
+    speed = _safe_float(row.get("speed_mean"))
+    occupancy = _safe_float(row.get("occupancy_mean"))
+    stopped_ratio = _safe_float(row.get("stopped_ratio"))
+
+    return (
+        density is not None and density >= cfg.force_density_min and
+        speed is not None and speed <= cfg.force_speed_max and
+        occupancy is not None and occupancy >= cfg.force_occupancy_min and
+        stopped_ratio is not None and stopped_ratio >= cfg.force_stopped_ratio_min
+    )
+
+
 def aggregate_final_event_scorevote(
     window_logs: List[Dict[str, object]],
     cfg: Optional[ScoreVoteConfig] = None,
@@ -106,14 +144,38 @@ def aggregate_final_event_scorevote(
         total_weight += weight
 
     window_count = len(window_logs)
+    max_cong_run = _max_congestion_run(window_logs)
+
+    # raw 기준 congestion 판별
+    raw_flags = [_is_raw_congestion_row(row, cfg) for row in window_logs]
+
+    raw_count = sum(raw_flags)
+
+    max_raw_run = 0
+    cur = 0
+    for flag in raw_flags:
+        if flag:
+            cur += 1
+            max_raw_run = max(max_raw_run, cur)
+        else:
+            cur = 0
+
+    force_by_run = (max_cong_run >= cfg.force_congestion_run)
+    force_by_raw = (raw_count >= cfg.force_raw_min_count)
+    force_by_raw_run = (max_raw_run >= cfg.force_congestion_run)
 
     if window_count == 0:
         final_event = "Empty"
         confidence = 0.0
     else:
         final_event = max(score_sum.items(), key=lambda item: item[1])[0]
+
+        # 강제 Congestion 규칙
+        if force_by_run or force_by_raw or force_by_raw_run:
+            final_event = "Congestion"
+
         denom = max(sum(score_sum.values()), 1e-9)
-        confidence = score_sum[final_event] / denom
+        confidence = score_sum.get(final_event, 0.0) / denom
 
     return FinalScoreVoteResult(
         final_event_type=final_event,

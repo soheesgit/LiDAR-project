@@ -1,3 +1,6 @@
+# encoder_utils.py
+# 이벤트 인코더가 쓰는 정규화, top-k 마스크, 안전 평균, density 계산 같은 공통 수치 유틸 모음
+
 from __future__ import annotations
 
 from typing import Optional

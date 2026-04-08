@@ -1,9 +1,12 @@
-from __future__ import annotations  # 타입 힌트에서 미래 기능(예: 클래스 자신 타입 참조)을 사용하기 위해 필요
-from dataclasses import dataclass   # 데이터 저장용 클래스를 간단히 정의하기 위한 데코레이터
-from pathlib import Path            # 파일/디렉토리 경로를 객체지향적으로 다루기 위한 모듈
-from typing import Tuple, Optional, Union  # 타입 힌트용
-import os                          # 운영체제 관련 기능 (환경변수, 파일 경로 등)
-import yaml                        # YAML 형식 설정 파일을 읽기 위해 사용
+# config.py
+# config.yaml을 읽어서 경로, ROI, 클러스터링, 분석 파라미터를 구조화된 Config 객체로 바꿔주는 설정 로더
+
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple, Optional, Union
+import os
+import yaml
 
 # ───────────────────────────────
 # [1] 프로젝트 주요 설정 데이터 구조 정의
